@@ -1773,7 +1773,7 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/db_info\n"
         "  Affiche la structure des tables d'accès.\n"
         "/list_users\n"
-        "  Affiche la liste de tous les utilisateurs ayant un accès, avec leur nom et username.\n"
+        "  Affiche la liste de tous les utilisateurs ayant un accès.\n"
         "/suspend_user <user_id>\n"
         "  Suspend l'accès d'un utilisateur (le bloque).\n"
         "/unsuspend_user <user_id>\n"
@@ -2226,17 +2226,11 @@ def main():
     db_path = os.path.abspath(DATABASE_FILE)
     print(f"Base de données utilisée : {db_path}")
     if not os.path.exists(DATABASE_FILE):
-        print("\033[91mERREUR FATALE : La base de données n'existe pas !\033[0m")
-        print("\033[91mLe bot refuse de démarrer pour éviter toute perte de données.\033[0m")
-        print("\033[93mPour restaurer une sauvegarde, utilisez la commande /restore_db ou copiez un fichier .db depuis le dossier backups/.\033[0m")
-        sys.exit(1)
+        print("\033[91mATTENTION : La base de données n'existait pas, elle va être créée.\033[0m")
     else:
         db_size = os.path.getsize(DATABASE_FILE)
         if db_size < 10 * 1024:
-            print(f"\033[91mERREUR FATALE : La base de données est très petite ({db_size} octets). Il est possible qu'elle soit vide ou corrompue.\033[0m")
-            print("\033[91mLe bot refuse de démarrer pour éviter toute perte de données.\033[0m")
-            print("\033[93mPour restaurer une sauvegarde, utilisez la commande /restore_db ou copiez un fichier .db depuis le dossier backups/.\033[0m")
-            sys.exit(1)
+            print(f"\033[91mATTENTION : La base de données est très petite ({db_size} octets). Il est possible qu'elle soit vide ou corrompue.\033[0m")
     
     # === Sauvegarde automatique de la base de données ===
     BACKUP_DIR = os.path.join(SCRIPT_DIR, "backups")
