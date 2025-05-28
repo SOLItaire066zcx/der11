@@ -14,6 +14,7 @@ from telegram.ext import (
 import secrets
 from telegram.constants import ParseMode
 import io
+import shutil
 
 # Token du bot
 TOKEN = "8057509848:AAHJsE1q63yn9OgBFftKiE8MUqOpidilBuw"
@@ -2117,6 +2118,92 @@ async def user_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if conn:
             conn.close()
 
+# === Commande admin pour sauvegarder la base de données ===
+async def backup_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    if not os.path.exists(DATABASE_FILE):
+        await update.message.reply_text("Fichier de base de données introuvable.")
+        return
+    try:
+        await update.message.reply_document(document=open(DATABASE_FILE, "rb"), filename=DATABASE_FILE)
+        await update.message.reply_text("✅ Sauvegarde de la base envoyée.")
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de l'envoi de la base : {e}")
+
+# === Commande admin pour restaurer la base de données ===
+async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    await update.message.reply_text(
+        "Merci d'envoyer le fichier .db à restaurer (nommé apple_predictor.db), via le trombone (📎).\nATTENTION : Cela remplacera toute la base actuelle après confirmation.",
+        reply_markup=ReplyKeyboardMarkup([["Annuler restauration"]], resize_keyboard=True)
+    )
+    context.user_data["awaiting_db_restore_file"] = True
+
+# === Handler pour réception d'un fichier .db pour restauration ===
+async def handle_db_restore_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+    if not context.user_data.get("awaiting_db_restore_file"):
+        return
+    if not update.message.document or not update.message.document.file_name.endswith(".db"):
+        await update.message.reply_text("Merci d'envoyer un fichier .db valide.")
+        return
+    file = await update.message.document.get_file()
+    temp_db_path = "restore_temp_apple_predictor.db"
+    try:
+        await file.download_to_drive(temp_db_path)
+        context.user_data["restore_db_file_path"] = temp_db_path
+        await update.message.reply_text(
+            "⚠️ Es-tu sûr de vouloir restaurer la base de données avec ce fichier ? Cela remplacera TOUTES les données actuelles. Réponds OUI pour confirmer, NON pour annuler.",
+            reply_markup=ReplyKeyboardMarkup([["OUI", "NON"]], resize_keyboard=True)
+        )
+        context.user_data["awaiting_db_restore_confirm"] = True
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de la réception du fichier : {e}")
+        context.user_data.pop("awaiting_db_restore_file", None)
+
+# === Handler pour confirmation de restauration de la base ===
+async def handle_db_restore_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+    if not context.user_data.get("awaiting_db_restore_confirm"):
+        return
+    response = update.message.text.strip().lower()
+    if response == "oui":
+        temp_db_path = context.user_data.get("restore_db_file_path")
+        if not temp_db_path or not os.path.exists(temp_db_path):
+            await update.message.reply_text("Fichier temporaire introuvable. Annulation.")
+            context.user_data.pop("awaiting_db_restore_confirm", None)
+            context.user_data.pop("awaiting_db_restore_file", None)
+            return
+        try:
+            # Sauvegarde l'ancienne base
+            if os.path.exists(DATABASE_FILE):
+                shutil.copy2(DATABASE_FILE, DATABASE_FILE + ".bak")
+            shutil.move(temp_db_path, DATABASE_FILE)
+            await update.message.reply_text("✅ Base restaurée avec succès ! L'ancienne base a été sauvegardée en .bak.", reply_markup=get_main_menu())
+        except Exception as e:
+            await update.message.reply_text(f"Erreur lors de la restauration : {e}")
+        finally:
+            context.user_data.pop("awaiting_db_restore_confirm", None)
+            context.user_data.pop("awaiting_db_restore_file", None)
+            context.user_data.pop("restore_db_file_path", None)
+    elif response == "non":
+        # Annule la restauration
+        temp_db_path = context.user_data.get("restore_db_file_path")
+        if temp_db_path and os.path.exists(temp_db_path):
+            os.remove(temp_db_path)
+        await update.message.reply_text("❌ Restauration annulée.", reply_markup=get_main_menu())
+        context.user_data.pop("awaiting_db_restore_confirm", None)
+        context.user_data.pop("awaiting_db_restore_file", None)
+        context.user_data.pop("restore_db_file_path", None)
+    else:
+        await update.message.reply_text("Merci de répondre par OUI ou NON.", reply_markup=ReplyKeyboardMarkup([["OUI", "NON"]], resize_keyboard=True))
+
 def main():
     # Vérifier que le dossier des images existe
     if not os.path.exists(IMAGES_DIR):
@@ -2229,6 +2316,12 @@ def main():
     application.add_handler(CommandHandler("user_status", user_status))
     application.add_handler(CommandHandler("user_history", user_history))
     application.add_handler(CommandHandler("user_email", user_email))
+    application.add_handler(CommandHandler("backup_db", backup_db))
+    application.add_handler(CommandHandler("restore_db", restore_db))
+    # Handler pour réception d'un fichier .db pour restauration
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_db_restore_file))
+    # Handler pour confirmation de restauration
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(OUI|NON|oui|non)$"), handle_db_restore_confirm))
 
     print("Bot démarré et base de données initialisée...")
     application.run_polling()
