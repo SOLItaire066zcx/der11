@@ -826,6 +826,9 @@ async def handle_export_format_choice(update: Update, context: ContextTypes.DEFA
 
 async def import_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Gère l'importation des données."""
+    # Si c'est un .db, ne rien faire ici (laisser le handler de restauration s'en occuper)
+    if update.message.document and update.message.document.file_name.endswith(".db"):
+        return
     if update.message.document:
         file = await update.message.document.get_file()
         filename = update.message.document.file_name
@@ -2422,7 +2425,7 @@ def main():
     application.add_handler(CommandHandler("user_email", user_email))
     application.add_handler(CommandHandler("backup_db", backup_db))
     application.add_handler(CommandHandler("restore_db", restore_db))
-    # Handler pour réception d'un fichier .db pour restauration
+    # Handler pour réception d'un fichier .db pour restauration (doit être AVANT l'import utilisateur)
     application.add_handler(MessageHandler(filters.Document.ALL, handle_db_restore_file))
     # Handler pour confirmation de restauration
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(OUI|NON|oui|non)$"), handle_db_restore_confirm))
