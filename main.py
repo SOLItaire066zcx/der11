@@ -1773,7 +1773,7 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/db_info\n"
         "  Affiche la structure des tables d'accès.\n"
         "/list_users\n"
-        "  Affiche la liste de tous les utilisateurs ayant un accès.\n"
+        "  Affiche la liste de tous les utilisateurs ayant un accès, avec leur nom et username.\n"
         "/suspend_user <user_id>\n"
         "  Suspend l'accès d'un utilisateur (le bloque).\n"
         "/unsuspend_user <user_id>\n"
