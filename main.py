@@ -1774,6 +1774,10 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  Affiche la structure des tables d'accès.\n"
         "/list_users\n"
         "  Affiche la liste de tous les utilisateurs ayant un accès.\n"
+        "/list_all_users\n"
+        "  Affiche la liste de tous les utilisateurs enregistrés (même sans accès).\n"
+        "/export_all_users\n"
+        "  Exporte la liste de tous les utilisateurs (user_id, nom, username) en TXT.\n"
         "/suspend_user <user_id>\n"
         "  Suspend l'accès d'un utilisateur (le bloque).\n"
         "/unsuspend_user <user_id>\n"
@@ -1801,6 +1805,9 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "\U0001F4C1 Sauvegarde automatique :\n"
         "  À chaque démarrage, une sauvegarde de la base est créée dans le dossier backups/.\n"
         "  Les 20 dernières sauvegardes sont conservées automatiquement.\n"
+        "\n"
+        "Mise à jour automatique :\n"
+        "  Le nom et le username de chaque utilisateur sont désormais mis à jour à chaque interaction (message ou bouton).\n"
     )
     await update.message.reply_text(msg)
 
@@ -2216,6 +2223,35 @@ async def handle_db_restore_confirm(update: Update, context: ContextTypes.DEFAUL
     else:
         await update.message.reply_text("Merci de répondre par OUI ou NON.", reply_markup=ReplyKeyboardMarkup([["OUI", "NON"]], resize_keyboard=True))
 
+# Fonction utilitaire pour mettre à jour le nom et le username à chaque interaction
+async def update_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    user_id = str(user.id)
+    name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+    username = user.username or ""
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+        if cursor.fetchone():
+            cursor.execute("UPDATE users SET name = ?, username = ? WHERE user_id = ?", (name, username, user_id))
+        else:
+            cursor.execute("INSERT INTO users (user_id, name, username) VALUES (?, ?, ?)", (user_id, name, username))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Erreur lors de la mise à jour du nom utilisateur {user_id}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+# Wrapper pour tous les handlers texte/bouton pour mettre à jour le nom à chaque interaction
+async def handle_button_with_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update_user_info(update, context)
+    await handle_button(update, context)
+
 def main():
     # Vérifier que le dossier des images existe
     if not os.path.exists(IMAGES_DIR):
@@ -2338,7 +2374,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(OUI|NON|oui|non)$"), handle_import_confirmation))
 
     # Handler général pour les boutons et textes (toujours en dernier)
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_button))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_button_with_update))
 
     # Ajout des commandes admin
     application.add_handler(CommandHandler("gen_code", gen_code))
