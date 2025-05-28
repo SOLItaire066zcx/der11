@@ -1773,7 +1773,11 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/db_info\n"
         "  Affiche la structure des tables d'accès.\n"
         "/list_users\n"
-        "  Affiche la liste de tous les utilisateurs ayant un accès.\n"
+        "  Affiche la liste de tous les utilisateurs ayant un accès (avec nom et username).\n"
+        "/list_all_users\n"
+        "  Affiche la liste de tous les utilisateurs enregistrés (même sans accès).\n"
+        "/export_all_users\n"
+        "  Exporte la liste de tous les utilisateurs (user_id, nom, username) en TXT.\n"
         "/suspend_user <user_id>\n"
         "  Suspend l'accès d'un utilisateur (le bloque).\n"
         "/unsuspend_user <user_id>\n"
@@ -2216,6 +2220,66 @@ async def handle_db_restore_confirm(update: Update, context: ContextTypes.DEFAUL
     else:
         await update.message.reply_text("Merci de répondre par OUI ou NON.", reply_markup=ReplyKeyboardMarkup([["OUI", "NON"]], resize_keyboard=True))
 
+# Commande admin pour lister tous les utilisateurs enregistrés (même sans accès)
+async def list_all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, name, username FROM users ORDER BY user_id")
+        rows = cursor.fetchall()
+        if not rows:
+            await update.message.reply_text("Aucun utilisateur trouvé dans la base.")
+            return
+        msg = "Liste de tous les utilisateurs enregistrés :\n"
+        for user_id, name, username in rows:
+            name = name or "-"
+            username = f"@{username}" if username else "-"
+            msg += f"- {user_id} | {name} ({username})\n"
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de la récupération des utilisateurs : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+# Commande admin pour exporter tous les utilisateurs enregistrés (TXT)
+async def export_all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    conn = None
+    try:
+        import io
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, name, username FROM users ORDER BY user_id")
+        rows = cursor.fetchall()
+        if not rows:
+            await update.message.reply_text("Aucun utilisateur trouvé dans la base.")
+            return
+        txt = io.StringIO()
+        txt.write("user_id | nom | username\n")
+        txt.write("-----------------------------\n")
+        for user_id, name, username in rows:
+            name = name or "-"
+            username = f"@{username}" if username else "-"
+            txt.write(f"{user_id} | {name} | {username}\n")
+        txt.seek(0)
+        await update.message.reply_document(
+            document=io.BytesIO(txt.getvalue().encode("utf-8")),
+            filename="all_users.txt"
+        )
+        await update.message.reply_text("✅ Export TXT de tous les utilisateurs envoyé.")
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de l'export : {e}")
+    finally:
+        if conn:
+            conn.close()
+
 def main():
     # Vérifier que le dossier des images existe
     if not os.path.exists(IMAGES_DIR):
@@ -2362,6 +2426,8 @@ def main():
     application.add_handler(MessageHandler(filters.Document.ALL, handle_db_restore_file))
     # Handler pour confirmation de restauration
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(OUI|NON|oui|non)$"), handle_db_restore_confirm))
+    application.add_handler(CommandHandler("list_all_users", list_all_users))
+    application.add_handler(CommandHandler("export_all_users", export_all_users))
 
     print("Bot démarré et base de données initialisée...")
     application.run_polling()
