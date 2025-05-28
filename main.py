@@ -2333,9 +2333,7 @@ def main():
     if not os.path.exists(DATABASE_FILE):
         print("\033[91mATTENTION : La base de données n'existait pas, elle va être créée.\033[0m")
     else:
-        db_size = os.path.getsize(DATABASE_FILE)
-        if db_size < 10 * 1024:
-            print(f"\033[91mATTENTION : La base de données est très petite ({db_size} octets). Il est possible qu'elle soit vide ou corrompue.\033[0m")
+        print("\033[92mBase de données trouvée, aucune suppression.\033[0m")
     
     # === Sauvegarde automatique de la base de données ===
     BACKUP_DIR = os.path.join(SCRIPT_DIR, "backups")
