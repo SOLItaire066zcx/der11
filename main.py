@@ -15,6 +15,8 @@ import secrets
 from telegram.constants import ParseMode
 import io
 import shutil
+import sys
+import glob
 
 # Token du bot
 TOKEN = "8057509848:AAHJsE1q63yn9OgBFftKiE8MUqOpidilBuw"
@@ -29,7 +31,8 @@ IMAGES_DIR = "images/cases"
 IMAGE_EXT = "jpg"
 
 # Fichier de base de données SQLite
-DATABASE_FILE = "apple_predictor.db"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE_FILE = os.path.join(SCRIPT_DIR, "apple_predictor.db")
 
 # États de conversation
 ASK_RESULTS, ASK_CASES, ASK_SIDE, ASK_BONNE_MAUVAISE, ASK_1XBET_ID, RESET_CONFIRM, ASK_BET_AMOUNT, ASK_EXPORT_FORMAT = range(8)
@@ -1789,6 +1792,15 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  Exporte tout l'historique d'un utilisateur en TXT.\n"
         "/user_email <user_id>\n"
         "  Exporte l'email, le nom et le username d'un utilisateur en TXT.\n"
+        "\n"
+        "\U0001F4BE /backup_db\n"
+        "  Sauvegarde manuelle de la base de données (fichier .db envoyé à l'admin).\n"
+        "/restore_db\n"
+        "  Restaure la base de données à partir d'un fichier .db (nécessite confirmation).\n"
+        "\n"
+        "\U0001F4C1 Sauvegarde automatique :\n"
+        "  À chaque démarrage, une sauvegarde de la base est créée dans le dossier backups/.\n"
+        "  Les 20 dernières sauvegardes sont conservées automatiquement.\n"
     )
     await update.message.reply_text(msg)
 
@@ -2209,6 +2221,34 @@ def main():
     if not os.path.exists(IMAGES_DIR):
         os.makedirs(IMAGES_DIR)
         logger.warning(f"Dossier {IMAGES_DIR} créé. Veuillez y placer vos images.")
+    
+    # Log du chemin de la base et vérification de sa taille
+    db_path = os.path.abspath(DATABASE_FILE)
+    print(f"Base de données utilisée : {db_path}")
+    if not os.path.exists(DATABASE_FILE):
+        print("\033[91mATTENTION : La base de données n'existait pas, elle va être créée.\033[0m")
+    else:
+        db_size = os.path.getsize(DATABASE_FILE)
+        if db_size < 10 * 1024:
+            print(f"\033[91mATTENTION : La base de données est très petite ({db_size} octets). Il est possible qu'elle soit vide ou corrompue.\033[0m")
+    
+    # === Sauvegarde automatique de la base de données ===
+    BACKUP_DIR = os.path.join(SCRIPT_DIR, "backups")
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    if os.path.exists(DATABASE_FILE):
+        now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = os.path.join(BACKUP_DIR, f"apple_predictor_{now_str}.db")
+        shutil.copy2(DATABASE_FILE, backup_path)
+        print(f"\033[92mSauvegarde automatique : {backup_path}\033[0m")
+        # Limite à 20 sauvegardes
+        backups = sorted(glob.glob(os.path.join(BACKUP_DIR, "apple_predictor_*.db")))
+        if len(backups) > 20:
+            for old_backup in backups[:-20]:
+                try:
+                    os.remove(old_backup)
+                    print(f"Suppression ancienne sauvegarde : {old_backup}")
+                except Exception as e:
+                    print(f"Erreur suppression sauvegarde {old_backup} : {e}")
     
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     init_db()  # Initialise la base de données au démarrage
