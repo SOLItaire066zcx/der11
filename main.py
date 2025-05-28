@@ -826,9 +826,6 @@ async def handle_export_format_choice(update: Update, context: ContextTypes.DEFA
 
 async def import_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Gère l'importation des données."""
-    # Si c'est un .db, ne rien faire ici (laisser le handler de restauration s'en occuper)
-    if update.message.document and update.message.document.file_name.endswith(".db"):
-        return
     if update.message.document:
         file = await update.message.document.get_file()
         filename = update.message.document.file_name
@@ -1776,11 +1773,7 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/db_info\n"
         "  Affiche la structure des tables d'accès.\n"
         "/list_users\n"
-        "  Affiche la liste de tous les utilisateurs ayant un accès (avec nom et username).\n"
-        "/list_all_users\n"
-        "  Affiche la liste de tous les utilisateurs enregistrés (même sans accès).\n"
-        "/export_all_users\n"
-        "  Exporte la liste de tous les utilisateurs (user_id, nom, username) en TXT.\n"
+        "  Affiche la liste de tous les utilisateurs ayant un accès.\n"
         "/suspend_user <user_id>\n"
         "  Suspend l'accès d'un utilisateur (le bloque).\n"
         "/unsuspend_user <user_id>\n"
@@ -2156,27 +2149,20 @@ async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
         return
-    print("[RESTORE_DB] Commande /restore_db reçue, attente d'un fichier .db...")
     await update.message.reply_text(
         "Merci d'envoyer le fichier .db à restaurer (nommé apple_predictor.db), via le trombone (📎).\nATTENTION : Cela remplacera toute la base actuelle après confirmation.",
         reply_markup=ReplyKeyboardMarkup([["Annuler restauration"]], resize_keyboard=True)
     )
     context.user_data["awaiting_db_restore_file"] = True
 
+# === Handler pour réception d'un fichier .db pour restauration ===
 async def handle_db_restore_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("[RESTORE_DB] handle_db_restore_file appelé")
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
-        print("[RESTORE_DB] Non admin, ignoré")
-        return
-    if not update.message.document or not update.message.document.file_name.endswith(".db"):
-        print("[RESTORE_DB] Fichier non .db, ignoré")
         return
     if not context.user_data.get("awaiting_db_restore_file"):
-        print("[RESTORE_DB] Pas en attente de restauration, refuse le fichier .db")
-        await update.message.reply_text(
-            "Pour restaurer la base, commence par la commande /restore_db puis envoie le fichier .db.",
-            reply_markup=ReplyKeyboardMarkup([["/restore_db"]], resize_keyboard=True)
-        )
+        return
+    if not update.message.document or not update.message.document.file_name.endswith(".db"):
+        await update.message.reply_text("Merci d'envoyer un fichier .db valide.")
         return
     file = await update.message.document.get_file()
     temp_db_path = "restore_temp_apple_predictor.db"
@@ -2188,25 +2174,20 @@ async def handle_db_restore_file(update: Update, context: ContextTypes.DEFAULT_T
             reply_markup=ReplyKeyboardMarkup([["OUI", "NON"]], resize_keyboard=True)
         )
         context.user_data["awaiting_db_restore_confirm"] = True
-        print(f"[RESTORE_DB] Fichier .db reçu et sauvegardé temporairement sous {temp_db_path}")
     except Exception as e:
-        print(f"[RESTORE_DB] Erreur lors de la réception du fichier : {e}")
         await update.message.reply_text(f"Erreur lors de la réception du fichier : {e}")
         context.user_data.pop("awaiting_db_restore_file", None)
 
+# === Handler pour confirmation de restauration de la base ===
 async def handle_db_restore_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("[RESTORE_DB] handle_db_restore_confirm appelé")
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
-        print("[RESTORE_DB] Non admin, ignoré")
         return
     if not context.user_data.get("awaiting_db_restore_confirm"):
-        print("[RESTORE_DB] Pas en attente de confirmation, ignoré")
         return
     response = update.message.text.strip().lower()
     if response == "oui":
         temp_db_path = context.user_data.get("restore_db_file_path")
         if not temp_db_path or not os.path.exists(temp_db_path):
-            print("[RESTORE_DB] Fichier temporaire introuvable, annulation")
             await update.message.reply_text("Fichier temporaire introuvable. Annulation.")
             context.user_data.pop("awaiting_db_restore_confirm", None)
             context.user_data.pop("awaiting_db_restore_file", None)
@@ -2217,86 +2198,23 @@ async def handle_db_restore_confirm(update: Update, context: ContextTypes.DEFAUL
                 shutil.copy2(DATABASE_FILE, DATABASE_FILE + ".bak")
             shutil.move(temp_db_path, DATABASE_FILE)
             await update.message.reply_text("✅ Base restaurée avec succès ! L'ancienne base a été sauvegardée en .bak.", reply_markup=get_main_menu())
-            print("[RESTORE_DB] Base restaurée avec succès")
         except Exception as e:
-            print(f"[RESTORE_DB] Erreur lors de la restauration : {e}")
             await update.message.reply_text(f"Erreur lors de la restauration : {e}")
         finally:
             context.user_data.pop("awaiting_db_restore_confirm", None)
             context.user_data.pop("awaiting_db_restore_file", None)
             context.user_data.pop("restore_db_file_path", None)
     elif response == "non":
+        # Annule la restauration
         temp_db_path = context.user_data.get("restore_db_file_path")
         if temp_db_path and os.path.exists(temp_db_path):
             os.remove(temp_db_path)
         await update.message.reply_text("❌ Restauration annulée.", reply_markup=get_main_menu())
-        print("[RESTORE_DB] Restauration annulée par l'admin")
         context.user_data.pop("awaiting_db_restore_confirm", None)
         context.user_data.pop("awaiting_db_restore_file", None)
         context.user_data.pop("restore_db_file_path", None)
     else:
         await update.message.reply_text("Merci de répondre par OUI ou NON.", reply_markup=ReplyKeyboardMarkup([["OUI", "NON"]], resize_keyboard=True))
-        print("[RESTORE_DB] Réponse non reconnue à la confirmation")
-
-# Commande admin pour lister tous les utilisateurs enregistrés (même sans accès)
-async def list_all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_TELEGRAM_ID:
-        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
-        return
-    conn = None
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id, name, username FROM users ORDER BY user_id")
-        rows = cursor.fetchall()
-        if not rows:
-            await update.message.reply_text("Aucun utilisateur trouvé dans la base.")
-            return
-        msg = "Liste de tous les utilisateurs enregistrés :\n"
-        for user_id, name, username in rows:
-            name = name or "-"
-            username = f"@{username}" if username else "-"
-            msg += f"- {user_id} | {name} ({username})\n"
-        await update.message.reply_text(msg)
-    except Exception as e:
-        await update.message.reply_text(f"Erreur lors de la récupération des utilisateurs : {e}")
-    finally:
-        if conn:
-            conn.close()
-
-# Commande admin pour exporter tous les utilisateurs enregistrés (TXT)
-async def export_all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_TELEGRAM_ID:
-        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
-        return
-    conn = None
-    try:
-        import io
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id, name, username FROM users ORDER BY user_id")
-        rows = cursor.fetchall()
-        if not rows:
-            await update.message.reply_text("Aucun utilisateur trouvé dans la base.")
-            return
-        txt = io.StringIO()
-        txt.write("user_id | nom | username\n")
-        txt.write("-----------------------------\n")
-        for user_id, name, username in rows:
-            name = name or "-"
-            username = f"@{username}" if username else "-"
-            txt.write(f"{user_id} | {name} | {username}\n")
-        txt.seek(0)
-        await update.message.reply_document(
-            document=io.BytesIO(txt.getvalue().encode("utf-8")),
-            filename="all_users.txt"
-        )
-        await update.message.reply_text("✅ Export TXT de tous les utilisateurs envoyé.")
-    except Exception as e:
-        await update.message.reply_text(f"Erreur lors de l'export : {e}")
-    finally:
-        if conn:
-            conn.close()
 
 def main():
     # Vérifier que le dossier des images existe
@@ -2336,11 +2254,6 @@ def main():
     init_db()  # Initialise la base de données au démarrage
     application = ApplicationBuilder().token(TOKEN).build()
 
-    # Handler pour la restauration de la base (doit être AVANT l'import utilisateur)
-    application.add_handler(CommandHandler("restore_db", restore_db))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_db_restore_file))
-    application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(OUI|NON|oui|non)$"), handle_db_restore_confirm))
-
     # Handler pour le bouton "🔄 Réinitialiser choix"
     application.add_handler(MessageHandler(filters.Regex("^(🔄 Réinitialiser choix|reinitialiser choix|réinitialiser choix)$"), reset_choix))
 
@@ -2358,7 +2271,7 @@ def main():
     application.add_handler(CommandHandler("stats", stats_perso))
     application.add_handler(CommandHandler("import", import_data))
 
-    # ConversationHandler pour la prédiction automatique
+# ConversationHandler pour la prédiction automatique
     auto_conv = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Regex("^(🍏 Prédire|prédire|predire)$"), predire_auto),
@@ -2419,7 +2332,7 @@ def main():
     )
     application.add_handler(export_conv)
 
-    # Handler pour les documents (import utilisateur)
+    # Handler pour les documents (import)
     application.add_handler(MessageHandler(filters.Document.ALL, import_data))
     # Handler pour la confirmation d'import (OUI/NON)
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(OUI|NON|oui|non)$"), handle_import_confirmation))
@@ -2444,8 +2357,11 @@ def main():
     application.add_handler(CommandHandler("user_history", user_history))
     application.add_handler(CommandHandler("user_email", user_email))
     application.add_handler(CommandHandler("backup_db", backup_db))
-    application.add_handler(CommandHandler("list_all_users", list_all_users))
-    application.add_handler(CommandHandler("export_all_users", export_all_users))
+    application.add_handler(CommandHandler("restore_db", restore_db))
+    # Handler pour réception d'un fichier .db pour restauration
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_db_restore_file))
+    # Handler pour confirmation de restauration
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(OUI|NON|oui|non)$"), handle_db_restore_confirm))
 
     print("Bot démarré et base de données initialisée...")
     application.run_polling()
