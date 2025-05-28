@@ -2252,6 +2252,42 @@ async def handle_button_with_update(update: Update, context: ContextTypes.DEFAUL
     await update_user_info(update, context)
     await handle_button(update, context)
 
+# Commande admin pour lister tous les utilisateurs enregistrés (même sans accès)
+async def list_all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print("[ADMIN] /list_all_users appelé")
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        # Vérifie si la table users existe
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+        if not cursor.fetchone():
+            await update.message.reply_text("La table 'users' n'existe pas dans la base de données.")
+            print("[ADMIN] Table 'users' absente")
+            return
+        cursor.execute("SELECT user_id, name, username FROM users ORDER BY user_id")
+        rows = cursor.fetchall()
+        if not rows:
+            await update.message.reply_text("Aucun utilisateur trouvé dans la base.")
+            print("[ADMIN] Table 'users' vide")
+            return
+        msg = "Liste de tous les utilisateurs enregistrés :\n"
+        for user_id, name, username in rows:
+            name = name or "-"
+            username = f"@{username}" if username else "-"
+            msg += f"- {user_id} | {name} ({username})\n"
+        await update.message.reply_text(msg)
+        print(f"[ADMIN] {len(rows)} utilisateurs listés")
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de la récupération des utilisateurs : {e}")
+        print(f"[ADMIN] Erreur : {e}")
+    finally:
+        if conn:
+            conn.close()
+
 def main():
     # Vérifier que le dossier des images existe
     if not os.path.exists(IMAGES_DIR):
@@ -2398,6 +2434,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.ALL, handle_db_restore_file))
     # Handler pour confirmation de restauration
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(OUI|NON|oui|non)$"), handle_db_restore_confirm))
+    application.add_handler(CommandHandler("list_all_users", list_all_users))
 
     print("Bot démarré et base de données initialisée...")
     application.run_polling()
