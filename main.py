@@ -2336,6 +2336,11 @@ def main():
     init_db()  # Initialise la base de données au démarrage
     application = ApplicationBuilder().token(TOKEN).build()
 
+    # Handler pour la restauration de la base (doit être AVANT l'import utilisateur)
+    application.add_handler(CommandHandler("restore_db", restore_db))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_db_restore_file))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(OUI|NON|oui|non)$"), handle_db_restore_confirm))
+
     # Handler pour le bouton "🔄 Réinitialiser choix"
     application.add_handler(MessageHandler(filters.Regex("^(🔄 Réinitialiser choix|reinitialiser choix|réinitialiser choix)$"), reset_choix))
 
@@ -2353,7 +2358,7 @@ def main():
     application.add_handler(CommandHandler("stats", stats_perso))
     application.add_handler(CommandHandler("import", import_data))
 
-# ConversationHandler pour la prédiction automatique
+    # ConversationHandler pour la prédiction automatique
     auto_conv = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Regex("^(🍏 Prédire|prédire|predire)$"), predire_auto),
@@ -2414,7 +2419,7 @@ def main():
     )
     application.add_handler(export_conv)
 
-    # Handler pour les documents (import)
+    # Handler pour les documents (import utilisateur)
     application.add_handler(MessageHandler(filters.Document.ALL, import_data))
     # Handler pour la confirmation d'import (OUI/NON)
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(OUI|NON|oui|non)$"), handle_import_confirmation))
@@ -2439,11 +2444,6 @@ def main():
     application.add_handler(CommandHandler("user_history", user_history))
     application.add_handler(CommandHandler("user_email", user_email))
     application.add_handler(CommandHandler("backup_db", backup_db))
-    application.add_handler(CommandHandler("restore_db", restore_db))
-    # Handler pour réception d'un fichier .db pour restauration (doit être AVANT l'import utilisateur)
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_db_restore_file))
-    # Handler pour confirmation de restauration
-    application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(OUI|NON|oui|non)$"), handle_db_restore_confirm))
     application.add_handler(CommandHandler("list_all_users", list_all_users))
     application.add_handler(CommandHandler("export_all_users", export_all_users))
 
