@@ -1731,6 +1731,8 @@ async def user_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "\n"
         "/start\n"
         "  Affiche le menu principal du bot.\n"
+        "/mon_acces ou /my_access\n"
+        "  Affiche la date d'expiration et le statut de ton accès.\n"
         "/fonctionnement\n"
         "  Explication du fonctionnement du jeu et du bot.\n"
         "/conseils\n"
@@ -2288,6 +2290,37 @@ async def list_all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if conn:
             conn.close()
 
+# Commande utilisateur pour voir son accès
+async def mon_acces(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT expiration, suspended FROM user_access WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        if not row:
+            await update.message.reply_text("⛔️ Tu n'as pas d'accès actif. Demande un code à l'administrateur.")
+            return
+        expiration, suspended = row
+        statut = "Actif" if (suspended is None or suspended == 0) else "Suspendu"
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if expiration < now:
+            msg = f"⏰ Ton accès a expiré le : {expiration}\nStatut : {statut}\nDemande un nouveau code à l'administrateur."
+        else:
+            msg = f"⏰ Ton accès est valable jusqu'au : {expiration}\nStatut : {statut}"
+            # Rappel si bientôt expiré (moins de 2 jours)
+            exp_dt = datetime.datetime.strptime(expiration, "%Y-%m-%d %H:%M:%S")
+            now_dt = datetime.datetime.now()
+            if (exp_dt - now_dt).total_seconds() < 2*24*3600:
+                msg += "\n⚠️ Ton accès expire bientôt, pense à demander un renouvellement."
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de la vérification de l'accès : {e}")
+    finally:
+        if conn:
+            conn.close()
+
 def main():
     # Vérifier que le dossier des images existe
     if not os.path.exists(IMAGES_DIR):
@@ -2435,6 +2468,8 @@ def main():
     # Handler pour confirmation de restauration
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(OUI|NON|oui|non)$"), handle_db_restore_confirm))
     application.add_handler(CommandHandler("list_all_users", list_all_users))
+    application.add_handler(CommandHandler("mon_acces", mon_acces))
+    application.add_handler(CommandHandler("my_access", mon_acces))
 
     print("Bot démarré et base de données initialisée...")
     application.run_polling()
