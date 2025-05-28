@@ -1659,9 +1659,24 @@ async def db_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         conn = sqlite3.connect(DATABASE_FILE)
         cursor = conn.cursor()
+        def format_table_info(table_name, info):
+            msg = f"\nStructure de {table_name} :\n"
+            msg += f"{'cid':<3} {'name':<18} {'type':<12} {'notnull':<7} {'dflt_value':<15} {'pk':<3}\n"
+            msg += "-"*65 + "\n"
+            for col in info:
+                cid, name, coltype, notnull, dflt_value, pk = col[:6]
+                msg += f"{cid:<3} {name:<18} {coltype:<12} {notnull!s:<7} {str(dflt_value):<15} {pk:<3}\n"
+            return msg
         access_codes_info = cursor.execute("PRAGMA table_info(access_codes)").fetchall()
         user_access_info = cursor.execute("PRAGMA table_info(user_access)").fetchall()
-        msg = "Structure de access_codes :\n" + str(access_codes_info) + "\n\nStructure de user_access :\n" + str(user_access_info)
+        users_info = cursor.execute("PRAGMA table_info(users)").fetchall()
+        history_info = cursor.execute("PRAGMA table_info(history)").fetchall()
+        msg = "\n".join([
+            format_table_info("access_codes", access_codes_info),
+            format_table_info("user_access", user_access_info),
+            format_table_info("users", users_info),
+            format_table_info("history", history_info)
+        ])
         await update.message.reply_text(msg)
     except Exception as e:
         await update.message.reply_text(f"Erreur lors de la lecture de la base : {e}")
@@ -1770,7 +1785,9 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/user_status <user_id>\n"
         "  Affiche le statut, les quotas et les 10 dernières prédictions d'un utilisateur.\n"
         "/user_history <user_id>\n"
-        "  Exporte tout l'historique d'un utilisateur en CSV.\n"
+        "  Exporte tout l'historique d'un utilisateur en TXT.\n"
+        "/user_email <user_id>\n"
+        "  Exporte l'email, le nom et le username d'un utilisateur en TXT.\n"
     )
     await update.message.reply_text(msg)
 
@@ -2022,19 +2039,78 @@ async def user_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rows:
             await update.message.reply_text("Aucun historique trouvé pour cet utilisateur.")
             return
-
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["type", "cote", "case_number", "side", "side_ref", "resultat", "date", "heure", "seconde", "bet_amount"])
-        for row in rows:
-            writer.writerow(row)
-        output.seek(0)
-
+        # Format TXT lisible, 2 lignes par séquence
+        import io
+        txt = io.StringIO()
+        for i in range(0, len(rows), 2):
+            try:
+                a = rows[i]
+                b = rows[i+1]
+            except IndexError:
+                continue
+            date = a[6] if a[6] else "-"
+            heure = a[7] if a[7] else "-"
+            sec = a[8] if a[8] else "-"
+            bet_amount = a[9] if a[9] else "-"
+            case123 = a[2] if a[2] else "?"
+            sens123 = a[3] if a[3] else "?"
+            res123 = a[5] if a[5] else "?"
+            case154 = b[2] if b[2] else "?"
+            sens154 = b[3] if b[3] else "?"
+            res154 = b[5] if b[5] else "?"
+            etat = "🏆" if a[0] == "gagne" else "💥"
+            txt.write(f"📅 {date} à {heure}:{sec} | Mise : {bet_amount}\n")
+            txt.write(f"1️⃣ Cote 1.23 : Case {case123} ({sens123}) — {res123}\n")
+            txt.write(f"2️⃣ Cote 1.54 : Case {case154} ({sens154}) — {res154}\n")
+            txt.write(f"Résultat : {etat}\n")
+            txt.write(f"--------------------\n")
+        txt.seek(0)
         await update.message.reply_document(
-            document=io.BytesIO(output.getvalue().encode("utf-8")),
-            filename=f"user_{user_id}_history.csv"
+            document=io.BytesIO(txt.getvalue().encode("utf-8")),
+            filename=f"user_{user_id}_history.txt"
         )
-        await update.message.reply_text("✅ Historique complet envoyé en CSV.")
+        await update.message.reply_text("✅ Historique complet envoyé en TXT.")
+    except Exception as e:
+        await update.message.reply_text(f"Erreur : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def user_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Utilisation : /user_email <user_id>")
+        return
+    user_id = context.args[0]
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT email, name, username FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        if not row:
+            await update.message.reply_text("Aucun utilisateur trouvé.")
+            return
+        email, name, username = row
+        if not email:
+            email = "Non renseigné"
+        if not name:
+            name = "Non renseigné"
+        if not username:
+            username = "Non renseigné"
+        import io
+        txt = io.StringIO()
+        txt.write(f"Email de l'utilisateur {user_id} : {email}\n")
+        txt.write(f"Nom : {name}\n")
+        txt.write(f"Username : {username}\n")
+        txt.seek(0)
+        await update.message.reply_document(
+            document=io.BytesIO(txt.getvalue().encode("utf-8")),
+            filename=f"user_{user_id}_info.txt"
+        )
+        await update.message.reply_text("✅ Email, nom et username exportés en .txt.")
     except Exception as e:
         await update.message.reply_text(f"Erreur : {e}")
     finally:
@@ -2152,6 +2228,7 @@ def main():
     application.add_handler(CommandHandler("set_limit", set_limit))
     application.add_handler(CommandHandler("user_status", user_status))
     application.add_handler(CommandHandler("user_history", user_history))
+    application.add_handler(CommandHandler("user_email", user_email))
 
     print("Bot démarré et base de données initialisée...")
     application.run_polling()
