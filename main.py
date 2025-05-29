@@ -2764,5 +2764,49 @@ async def admin_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Erreur lors de la lecture des logs : {e}")
 
+async def set_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    if len(context.args) != 2:
+        await update.message.reply_text("Utilisation : /set_role <user_id> <role> (admin, vip, test, user)")
+        return
+    user_id, role = context.args
+    role = role.lower()
+    if role not in ["admin", "vip", "test", "user"]:
+        await update.message.reply_text("Rôle invalide. Choisis parmi : admin, vip, test, user.")
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET role = ? WHERE user_id = ?", (role, user_id))
+        conn.commit()
+        await update.message.reply_text(f"Rôle de l'utilisateur {user_id} mis à jour : {role}")
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de la modification du rôle : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def my_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT role FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        if row:
+            role = row[0] or "user"
+            await update.message.reply_text(f"Ton rôle : {role}")
+        else:
+            await update.message.reply_text("Aucun rôle trouvé pour ton compte.")
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de la récupération du rôle : {e}")
+    finally:
+        if conn:
+            conn.close()
+
 if __name__ == "__main__":
     main()
