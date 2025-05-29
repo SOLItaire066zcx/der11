@@ -17,6 +17,7 @@ import io
 import shutil
 import sys
 import glob
+import re
 
 # Token du bot
 TOKEN = "8057509848:AAHJsE1q63yn9OgBFftKiE8MUqOpidilBuw"
@@ -78,6 +79,11 @@ def init_db():
             username TEXT
         );
         ''')
+        # Ajout de la colonne role si elle n'existe pas
+        cursor.execute("PRAGMA table_info(users)")
+        user_columns = [row[1] for row in cursor.fetchall()]
+        if "role" not in user_columns:
+            cursor.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'")
 
         # Table de l'historique
         cursor.execute('''
@@ -1586,6 +1592,8 @@ def check_access(user_id):
 
 # Commande admin pour générer un code
 async def gen_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cleanup_expired_access_codes()
+    log_admin_action("GEN_CODE", admin_id=update.effective_user.id, details=f"args={context.args}")
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("⛔️ Seul l'administrateur peut générer des codes d'accès.")
         return
@@ -1615,6 +1623,8 @@ async def gen_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Commande utilisateur pour activer un code
 async def activate_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cleanup_expired_access_codes()
+    log_admin_action("ACTIVATE_CODE", admin_id=update.effective_user.id, details=f"args={context.args}")
     user_id = str(update.effective_user.id)
     if len(context.args) != 1:
         await update.message.reply_text("Utilisation : /activate <code>")
@@ -1656,6 +1666,7 @@ async def activate_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Commande admin pour afficher la structure de la base
 async def db_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_admin_action("DB_INFO", admin_id=update.effective_user.id)
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
         return
@@ -1690,6 +1701,7 @@ async def db_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Commande admin pour lister tous les utilisateurs ayant un accès
 async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_admin_action("LIST_USERS", admin_id=update.effective_user.id)
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
         return
@@ -1784,10 +1796,10 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  Suspend l'accès d'un utilisateur (le bloque).\n"
         "/unsuspend_user <user_id>\n"
         "  Réactive l'accès d'un utilisateur suspendu.\n"
-        "/extend_access <user_id> <minutes>\n"
-        "  Prolonge la durée d'accès d'un utilisateur.\n"
-        "/reduce_access <user_id> <minutes>\n"
-        "  Réduit la durée d'accès d'un utilisateur.\n"
+        "/extend_access <user_id> <minutes|2h|3j|15m>\n"
+        "  Prolonge la durée d'accès d'un utilisateur. Accepte aussi 2h, 3j, 15m, etc.\n"
+        "/reduce_access <user_id> <minutes|2h|3j|15m>\n"
+        "  Réduit la durée d'accès d'un utilisateur. Accepte aussi 2h, 3j, 15m, etc.\n"
         "/set_access <user_id> <YYYY-MM-DD HH:MM:SS>\n"
         "  Définit une nouvelle date d'expiration pour l'accès d'un utilisateur.\n"
         "/set_limit <user_id> <par_jour> <par_heure> <total>\n"
@@ -1808,13 +1820,39 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  À chaque démarrage, une sauvegarde de la base est créée dans le dossier backups/.\n"
         "  Les 20 dernières sauvegardes sont conservées automatiquement.\n"
         "\n"
+        "\U0001F50D /admin_logs\n"
+        "  Affiche les 50 dernières actions administrateur (journalisation automatique).\n"
+        "  Toutes les actions admin sensibles sont enregistrées dans le fichier admin_actions.log (dans le dossier du bot).\n"
+        "\n"
+        "Nettoyage automatique :\n"
+        "  Les codes d'accès expirés non utilisés sont supprimés automatiquement au démarrage et lors de chaque génération/activation de code.\n"
+        "\n"
         "Mise à jour automatique :\n"
         "  Le nom et le username de chaque utilisateur sont désormais mis à jour à chaque interaction (message ou bouton).\n"
+        "/find_user <username|email>\n"
+        "  Recherche un utilisateur par username ou email (affiche l'user_id, nom, username, email).\n"
+        "/user_stats <user_id>\n"
+        "  Statistiques avancées sur l'activité d'un utilisateur (séquences, taux, jours actifs, etc.).\n"
+        "/set_role <user_id> <role>\n"
+        "  Définit le rôle d'un utilisateur (admin, vip, test, user).\n"
+        "/my_role\n"
+        "  Permet à l'utilisateur de voir son rôle actuel.\n"
+        "\n"
+        "Système de rôles :\n"
+        "  - admin : accès total, gestion du bot\n"
+        "  - vip : accès privilégié\n"
+        "  - test : accès temporaire ou test\n"
+        "  - user : accès standard\n"
+        "/reset_access <user_id>\n"
+        "  Réinitialise l'expiration de l'utilisateur à +30 jours à partir de maintenant.\n"
+        "/delete_user <user_id>\n"
+        "  Supprime complètement l'utilisateur de toutes les tables (attention, action irréversible !).\n"
     )
     await update.message.reply_text(msg)
 
 # Commande admin pour suspendre un utilisateur
 async def suspend_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_admin_action("SUSPEND_USER", admin_id=update.effective_user.id, details=f"args={context.args}")
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
         return
@@ -1829,6 +1867,11 @@ async def suspend_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("UPDATE user_access SET suspended = 1 WHERE user_id = ?", (user_id,))
         conn.commit()
         await update.message.reply_text(f"Utilisateur {user_id} suspendu (bloqué).")
+        # Notification automatique à l'utilisateur
+        try:
+            await context.bot.send_message(chat_id=int(user_id), text="🚫 Ton accès au bot a été suspendu par l'administrateur. Contacte-le si besoin.")
+        except Exception as e:
+            logger.warning(f"Impossible de notifier l'utilisateur {user_id} de la suspension : {e}")
     except Exception as e:
         await update.message.reply_text(f"Erreur lors de la suspension : {e}")
     finally:
@@ -1837,6 +1880,7 @@ async def suspend_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Commande admin pour réactiver un utilisateur suspendu
 async def unsuspend_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_admin_action("UNSUSPEND_USER", admin_id=update.effective_user.id, details=f"args={context.args}")
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
         return
@@ -1851,6 +1895,11 @@ async def unsuspend_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("UPDATE user_access SET suspended = 0 WHERE user_id = ?", (user_id,))
         conn.commit()
         await update.message.reply_text(f"Utilisateur {user_id} réactivé.")
+        # Notification automatique à l'utilisateur
+        try:
+            await context.bot.send_message(chat_id=int(user_id), text="✅ Ton accès au bot a été réactivé par l'administrateur. Tu peux de nouveau utiliser le bot.")
+        except Exception as e:
+            logger.warning(f"Impossible de notifier l'utilisateur {user_id} de la réactivation : {e}")
     except Exception as e:
         await update.message.reply_text(f"Erreur lors de la réactivation : {e}")
     finally:
@@ -1858,17 +1907,18 @@ async def unsuspend_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
 # Commande admin pour prolonger la durée d'accès d'un utilisateur
 async def extend_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_admin_action("EXTEND_ACCESS", admin_id=update.effective_user.id, details=f"args={context.args}")
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
         return
     if len(context.args) != 2:
-        await update.message.reply_text("Utilisation : /extend_access <user_id> <minutes>")
+        await update.message.reply_text("Utilisation : /extend_access <user_id> <minutes|2h|3j|15m>")
         return
-    user_id, minutes = context.args
+    user_id, duration = context.args
     try:
-        minutes = int(minutes)
-    except ValueError:
-        await update.message.reply_text("Le nombre de minutes doit être un entier.")
+        minutes = parse_flexible_duration(duration)
+    except Exception as e:
+        await update.message.reply_text(f"Format de durée invalide : {e}")
         return
     conn = None
     try:
@@ -1884,6 +1934,10 @@ async def extend_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("UPDATE user_access SET expiration = ? WHERE user_id = ?", (new_exp, user_id))
         conn.commit()
         await update.message.reply_text(f"Accès de {user_id} prolongé jusqu'au {new_exp}.")
+        try:
+            await context.bot.send_message(chat_id=int(user_id), text=f"⏳ Ton accès au bot a été prolongé par l'administrateur. Nouvelle expiration : {new_exp}")
+        except Exception as e:
+            logger.warning(f"Impossible de notifier l'utilisateur {user_id} de la prolongation : {e}")
     except Exception as e:
         await update.message.reply_text(f"Erreur lors de la prolongation : {e}")
     finally:
@@ -1892,17 +1946,18 @@ async def extend_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Commande admin pour réduire la durée d'accès d'un utilisateur
 async def reduce_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_admin_action("REDUCE_ACCESS", admin_id=update.effective_user.id, details=f"args={context.args}")
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
         return
     if len(context.args) != 2:
-        await update.message.reply_text("Utilisation : /reduce_access <user_id> <minutes>")
+        await update.message.reply_text("Utilisation : /reduce_access <user_id> <minutes|2h|3j|15m>")
         return
-    user_id, minutes = context.args
+    user_id, duration = context.args
     try:
-        minutes = int(minutes)
-    except ValueError:
-        await update.message.reply_text("Le nombre de minutes doit être un entier.")
+        minutes = parse_flexible_duration(duration)
+    except Exception as e:
+        await update.message.reply_text(f"Format de durée invalide : {e}")
         return
     conn = None
     try:
@@ -1918,6 +1973,10 @@ async def reduce_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("UPDATE user_access SET expiration = ? WHERE user_id = ?", (new_exp, user_id))
         conn.commit()
         await update.message.reply_text(f"Accès de {user_id} réduit jusqu'au {new_exp}.")
+        try:
+            await context.bot.send_message(chat_id=int(user_id), text=f"⚠️ La durée de ton accès au bot a été réduite par l'administrateur. Nouvelle expiration : {new_exp}")
+        except Exception as e:
+            logger.warning(f"Impossible de notifier l'utilisateur {user_id} de la réduction : {e}")
     except Exception as e:
         await update.message.reply_text(f"Erreur lors de la réduction : {e}")
     finally:
@@ -1925,6 +1984,7 @@ async def reduce_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
 # Commande admin pour fixer une nouvelle date d'expiration
 async def set_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_admin_action("SET_ACCESS", admin_id=update.effective_user.id, details=f"args={context.args}")
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
         return
@@ -1953,6 +2013,7 @@ async def set_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Commande admin pour définir les limites personnalisées d'un utilisateur
 async def set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_admin_action("SET_LIMIT", admin_id=update.effective_user.id, details=f"args={context.args}")
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
         return
@@ -1982,6 +2043,7 @@ async def set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Commande admin pour surveiller un utilisateur
 async def user_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_admin_action("USER_STATUS", admin_id=update.effective_user.id, details=f"args={context.args}")
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
         return
@@ -2041,6 +2103,7 @@ async def user_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Commande admin pour exporter tout l'historique d'un utilisateur
 async def user_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_admin_action("USER_HISTORY", admin_id=update.effective_user.id, details=f"args={context.args}")
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
         return
@@ -2099,6 +2162,7 @@ async def user_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
 
 async def user_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_admin_action("USER_EMAIL", admin_id=update.effective_user.id, details=f"args={context.args}")
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
         return
@@ -2141,6 +2205,7 @@ async def user_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === Commande admin pour sauvegarder la base de données ===
 async def backup_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_admin_action("BACKUP_DB", admin_id=update.effective_user.id)
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
         return
@@ -2155,6 +2220,7 @@ async def backup_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === Commande admin pour restaurer la base de données ===
 async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_admin_action("RESTORE_DB", admin_id=update.effective_user.id)
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
         return
@@ -2256,6 +2322,7 @@ async def handle_button_with_update(update: Update, context: ContextTypes.DEFAUL
 
 # Commande admin pour lister tous les utilisateurs enregistrés (même sans accès)
 async def list_all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_admin_action("LIST_ALL_USERS", admin_id=update.effective_user.id)
     print("[ADMIN] /list_all_users appelé")
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
@@ -2309,14 +2376,205 @@ async def mon_acces(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = f"⏰ Ton accès a expiré le : {expiration}\nStatut : {statut}\nDemande un nouveau code à l'administrateur."
         else:
             msg = f"⏰ Ton accès est valable jusqu'au : {expiration}\nStatut : {statut}"
-            # Rappel si bientôt expiré (moins de 2 jours)
+            # Affichage du temps restant
             exp_dt = datetime.datetime.strptime(expiration, "%Y-%m-%d %H:%M:%S")
             now_dt = datetime.datetime.now()
-            if (exp_dt - now_dt).total_seconds() < 2*24*3600:
+            delta = exp_dt - now_dt
+            if delta.total_seconds() > 0:
+                jours = delta.days
+                heures = delta.seconds // 3600
+                minutes = (delta.seconds % 3600) // 60
+                msg += f"\n⏳ Temps restant : "
+                if jours > 0:
+                    msg += f"{jours}j "
+                if heures > 0 or jours > 0:
+                    msg += f"{heures}h "
+                msg += f"{minutes}min"
+            # Rappel si bientôt expiré (moins de 2 jours)
+            if delta.total_seconds() < 2*24*3600:
                 msg += "\n⚠️ Ton accès expire bientôt, pense à demander un renouvellement."
         await update.message.reply_text(msg)
     except Exception as e:
         await update.message.reply_text(f"Erreur lors de la vérification de l'accès : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+def cleanup_expired_access_codes():
+    """Supprime les codes d'accès expirés et non utilisés de la table access_codes."""
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute("DELETE FROM access_codes WHERE expiration < ? AND used = 0", (now,))
+        conn.commit()
+        logger.info("Nettoyage des codes d'accès expirés non utilisés effectué.")
+    except Exception as e:
+        logger.error(f"Erreur lors du nettoyage des codes d'accès expirés : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+def log_admin_action(action, admin_id=None, details=None):
+    """Journalise une action administrateur dans un fichier log dédié."""
+    log_file = os.path.join(SCRIPT_DIR, "admin_actions.log")
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    admin_id = admin_id or "?"
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(f"[{now}] ADMIN {admin_id} : {action} | {details or ''}\n")
+
+async def find_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Utilisation : /find_user <username|email>")
+        return
+    search = context.args[0].strip().lower()
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        # Recherche par username
+        cursor.execute("SELECT user_id, name, username, email FROM users WHERE LOWER(username) = ?", (search,))
+        row = cursor.fetchone()
+        if not row:
+            # Recherche par email
+            cursor.execute("SELECT user_id, name, username, email FROM users WHERE LOWER(email) = ?", (search,))
+            row = cursor.fetchone()
+        if row:
+            user_id, name, username, email = row
+            msg = f"Utilisateur trouvé :\n- user_id : {user_id}\n- nom : {name or '-'}\n- username : @{username or '-'}\n- email : {email or '-'}"
+        else:
+            msg = "Aucun utilisateur trouvé avec ce username ou email."
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de la recherche : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Utilisation : /user_stats <user_id>")
+        return
+    user_id = context.args[0]
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        # Nombre total de séquences (2 entrées par séquence)
+        cursor.execute("SELECT COUNT(*) FROM history WHERE user_id = ?", (user_id,))
+        total_entries = cursor.fetchone()[0]
+        total_sequences = total_entries // 2
+        # Dates de première et dernière activité
+        cursor.execute("SELECT MIN(date), MAX(date) FROM history WHERE user_id = ?", (user_id,))
+        min_date, max_date = cursor.fetchone()
+        # Nombre de jours actifs
+        cursor.execute("SELECT COUNT(DISTINCT date) FROM history WHERE user_id = ?", (user_id,))
+        days_active = cursor.fetchone()[0]
+        # Victoires/défaites par cote
+        cursor.execute("SELECT cote, resultat, COUNT(*) FROM history WHERE user_id = ? AND (resultat = 'Bonne' OR resultat = 'Mauvaise') GROUP BY cote, resultat", (user_id,))
+        results = cursor.fetchall()
+        victoire_123 = victoire_154 = defaites_123 = defaites_154 = 0
+        for cote, resultat, count in results:
+            if cote == "1.23":
+                if resultat == "Bonne":
+                    victoire_123 = count
+                elif resultat == "Mauvaise":
+                    defaites_123 = count
+            elif cote == "1.54":
+                if resultat == "Bonne":
+                    victoire_154 = count
+                elif resultat == "Mauvaise":
+                    defaites_154 = count
+        taux_123 = round((victoire_123 / (victoire_123 + defaites_123)) * 100, 1) if (victoire_123 + defaites_123) > 0 else 0
+        taux_154 = round((victoire_154 / (victoire_154 + defaites_154)) * 100, 1) if (victoire_154 + defaites_154) > 0 else 0
+        # Moyenne de séquences par jour
+        avg_seq_per_day = round(total_sequences / days_active, 2) if days_active > 0 else 0
+        msg = (
+            f"📊 Statistiques avancées pour l'utilisateur {user_id}\n"
+            f"- Séquences jouées : {total_sequences}\n"
+            f"- Jours actifs : {days_active}\n"
+            f"- Première activité : {min_date or '-'}\n"
+            f"- Dernière activité : {max_date or '-'}\n"
+            f"- Moyenne de séquences/jour : {avg_seq_per_day}\n"
+            f"- Victoires cote 1.23 : {victoire_123} | Défaites : {defaites_123} | Taux : {taux_123}%\n"
+            f"- Victoires cote 1.54 : {victoire_154} | Défaites : {defaites_154} | Taux : {taux_154}%\n"
+        )
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors du calcul des stats : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+def parse_flexible_duration(duration_str):
+    """Convertit une durée flexible (ex: 2h, 3j, 15m, 120) en minutes."""
+    duration_str = duration_str.strip().lower()
+    match = re.match(r"^(\d+)([mhdj]?)$", duration_str)
+    if not match:
+        raise ValueError("Format de durée invalide. Exemples valides : 120, 2h, 3j, 15m")
+    value, unit = match.groups()
+    value = int(value)
+    if unit in ('', 'm'):
+        return value
+    elif unit == 'h':
+        return value * 60
+    elif unit in ('j', 'd'):
+        return value * 1440
+    else:
+        raise ValueError("Unité de durée non reconnue.")
+
+async def reset_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Utilisation : /reset_access <user_id>")
+        return
+    user_id = context.args[0]
+    new_exp = (datetime.datetime.now() + datetime.timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE user_access SET expiration = ? WHERE user_id = ?", (new_exp, user_id))
+        conn.commit()
+        await update.message.reply_text(f"Expiration de l'utilisateur {user_id} réinitialisée à {new_exp}.")
+        try:
+            await context.bot.send_message(chat_id=int(user_id), text=f"⏳ Ton accès a été réinitialisé par l'administrateur. Nouvelle expiration : {new_exp}")
+        except Exception as e:
+            logger.warning(f"Impossible de notifier l'utilisateur {user_id} du reset : {e}")
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors du reset : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def delete_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Utilisation : /delete_user <user_id>")
+        return
+    user_id = context.args[0]
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
+        cursor.execute("DELETE FROM user_access WHERE user_id = ?", (user_id,))
+        cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        conn.commit()
+        await update.message.reply_text(f"Utilisateur {user_id} supprimé de toutes les tables.")
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de la suppression : {e}")
     finally:
         if conn:
             conn.close()
@@ -2353,6 +2611,8 @@ def main():
                 except Exception as e:
                     print(f"Erreur suppression sauvegarde {old_backup} : {e}")
     
+    cleanup_expired_access_codes()  # Nettoyage des codes expirés au démarrage
+
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     init_db()  # Initialise la base de données au démarrage
     application = ApplicationBuilder().token(TOKEN).build()
@@ -2468,6 +2728,23 @@ def main():
     application.add_handler(CommandHandler("list_all_users", list_all_users))
     application.add_handler(CommandHandler("mon_acces", mon_acces))
     application.add_handler(CommandHandler("my_access", mon_acces))
+
+    # Ajout de la commande admin_logs
+    application.add_handler(CommandHandler("admin_logs", admin_logs))
+
+    # Ajout du handler pour la recherche d'utilisateur
+    application.add_handler(CommandHandler("find_user", find_user))
+
+    # Ajout du handler pour les statistiques avancées
+    application.add_handler(CommandHandler("user_stats", user_stats))
+
+    # Ajout des commandes pour définir le rôle
+    application.add_handler(CommandHandler("set_role", set_role))
+    application.add_handler(CommandHandler("my_role", my_role))
+
+    # Ajout des commandes pour réinitialiser l'expiration et supprimer l'utilisateur
+    application.add_handler(CommandHandler("reset_access", reset_access))
+    application.add_handler(CommandHandler("delete_user", delete_user))
 
     print("Bot démarré et base de données initialisée...")
     application.run_polling()
