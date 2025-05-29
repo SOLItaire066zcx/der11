@@ -2749,5 +2749,20 @@ def main():
     print("Bot démarré et base de données initialisée...")
     application.run_polling()
 
+async def admin_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    log_file = os.path.join(SCRIPT_DIR, "admin_actions.log")
+    if not os.path.exists(log_file):
+        await update.message.reply_text("Aucun log d'action admin trouvé.")
+        return
+    try:
+        with open(log_file, "r", encoding="utf-8") as f:
+            logs = f.readlines()[-50:]  # Dernières 50 actions
+        await update.message.reply_text("Dernières actions admin :\n" + ''.join(logs[-50:]) or "Aucune action enregistrée.")
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de la lecture des logs : {e}")
+
 if __name__ == "__main__":
     main()
