@@ -18,6 +18,7 @@ import shutil
 import sys
 import glob
 import re
+import asyncio
 
 # Token du bot
 TOKEN = "8057509848:AAHJsE1q63yn9OgBFftKiE8MUqOpidilBuw"
@@ -57,11 +58,6 @@ MESSAGES = {
     "error": "❌ Une erreur s'est produite. Veuillez réessayer.",
     "no_image": "⚠️ Image non disponible pour cette direction."
 }
-
-# Limites globales par défaut
-MAX_PREDICTIONS_PER_DAY = 10
-MAX_PREDICTIONS_PER_HOUR = 3
-MAX_PREDICTIONS_TOTAL = 100
 
 # Initialisation de la base de données
 def init_db():
@@ -104,8 +100,7 @@ def init_db():
         );
         ''')
 
-
-# Table des codes d'accès (ajout de for_user_id et used)
+        # Table des codes d'accès
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS access_codes (
             code TEXT PRIMARY KEY,
@@ -114,35 +109,36 @@ def init_db():
             used INTEGER DEFAULT 0
         );
         ''')
+
         # Table des accès utilisateurs
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS user_access (
             user_id TEXT PRIMARY KEY,
-            expiration DATETIME
+            expiration DATETIME,
+            suspended INTEGER DEFAULT 0,
+            predictions_today INTEGER DEFAULT 0,
+            last_prediction_day TEXT DEFAULT NULL,
+            limit_per_day INTEGER DEFAULT NULL
         );
         ''')
-        # Ajout de la colonne suspended si elle n'existe pas
+
+        # Vérification et mise à jour des colonnes
         cursor.execute("PRAGMA table_info(user_access)")
         columns = [row[1] for row in cursor.fetchall()]
-        if "suspended" not in columns:
-            cursor.execute("ALTER TABLE user_access ADD COLUMN suspended INTEGER DEFAULT 0")
-        # Ajout des colonnes pour les limites et compteurs si elles n'existent pas
-        if "predictions_today" not in columns:
+        
+        # Suppression et recréation des colonnes problématiques
+        if "predictions_today" in columns:
+            cursor.execute("ALTER TABLE user_access DROP COLUMN predictions_today")
+        if "last_prediction_day" in columns:
+            cursor.execute("ALTER TABLE user_access DROP COLUMN last_prediction_day")
+        if "limit_per_day" in columns:
+            cursor.execute("ALTER TABLE user_access DROP COLUMN limit_per_day")
+            
+        # Ajout des colonnes avec les bonnes valeurs par défaut
             cursor.execute("ALTER TABLE user_access ADD COLUMN predictions_today INTEGER DEFAULT 0")
-        if "last_prediction_day" not in columns:
-            cursor.execute("ALTER TABLE user_access ADD COLUMN last_prediction_day TEXT")
-        if "predictions_hour" not in columns:
-            cursor.execute("ALTER TABLE user_access ADD COLUMN predictions_hour INTEGER DEFAULT 0")
-        if "last_prediction_hour" not in columns:
-            cursor.execute("ALTER TABLE user_access ADD COLUMN last_prediction_hour TEXT")
-        if "predictions_total" not in columns:
-            cursor.execute("ALTER TABLE user_access ADD COLUMN predictions_total INTEGER DEFAULT 0")
-        if "limit_per_day" not in columns:
-            cursor.execute("ALTER TABLE user_access ADD COLUMN limit_per_day INTEGER")
-        if "limit_per_hour" not in columns:
-            cursor.execute("ALTER TABLE user_access ADD COLUMN limit_per_hour INTEGER")
-        if "limit_total" not in columns:
-            cursor.execute("ALTER TABLE user_access ADD COLUMN limit_total INTEGER")
+        cursor.execute("ALTER TABLE user_access ADD COLUMN last_prediction_day TEXT DEFAULT NULL")
+        cursor.execute("ALTER TABLE user_access ADD COLUMN limit_per_day INTEGER DEFAULT NULL")
+
         conn.commit()
         logging.info("Base de données initialisée avec succès.")
     except sqlite3.Error as e:
@@ -1139,61 +1135,109 @@ async def predire_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if int(user_id) != ADMIN_TELEGRAM_ID and not check_access(user_id):
         await update.message.reply_text("⛔️ Accès refusé. Merci de demander un code d'accès à l'administrateur.")
         return
-    # Vérification des limites
-    conn = None
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        now = datetime.datetime.now()
-        today_str = now.strftime("%Y-%m-%d")
-        hour_str = now.strftime("%Y-%m-%d %H")
-        cursor.execute("SELECT predictions_today, last_prediction_day, predictions_hour, last_prediction_hour, predictions_total, limit_per_day, limit_per_hour, limit_total FROM user_access WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-        if row:
-            predictions_today, last_day, predictions_hour, last_hour, predictions_total, limit_per_day, limit_per_hour, limit_total = row
-            # Limites personnalisées ou globales
-            limit_per_day = limit_per_day if limit_per_day is not None else MAX_PREDICTIONS_PER_DAY
-            limit_per_hour = limit_per_hour if limit_per_hour is not None else MAX_PREDICTIONS_PER_HOUR
-            limit_total = limit_total if limit_total is not None else MAX_PREDICTIONS_TOTAL
-            # Reset si changement de jour/heure
-            if last_day != today_str:
+    
+    # Vérification des limites uniquement pour la prédiction finale
+    if int(user_id) != ADMIN_TELEGRAM_ID:
+        conn = None
+        try:
+            conn = sqlite3.connect(DATABASE_FILE)
+            cursor = conn.cursor()
+            now = datetime.datetime.now()
+            today_str = now.strftime("%Y-%m-%d")
+            
+            # Vérification de la limite quotidienne
+            cursor.execute("""
+                SELECT predictions_today, 
+                       CASE 
+                           WHEN last_prediction_day IS NULL THEN NULL 
+                           ELSE substr(last_prediction_day, 1, 10) 
+                       END as last_day,
+                       limit_per_day, 
+                       suspended 
+                FROM user_access 
+                WHERE user_id = ?
+            """, (user_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                await update.message.reply_text("❌ Erreur : Utilisateur non trouvé dans la base de données.")
+                return
+                
+            predictions_today, last_day, limit_per_day, suspended = row
+            
+            # Log des valeurs actuelles
+            print(f"\n[DEBUG] User {user_id} - État initial:")
+            print(f"predictions_today = {predictions_today}")
+            print(f"last_day = {last_day}")
+            print(f"limit_per_day = {limit_per_day}")
+            print(f"today_str = {today_str}")
+            
+            # Vérifier si l'utilisateur est suspendu
+            if suspended:
+                await update.message.reply_text("❌ Votre compte est suspendu. Contactez l'administrateur.")
+                return
+            
+            # Si aucune limite n'est définie, on autorise toutes les prédictions
+            if limit_per_day is None:
                 predictions_today = 0
                 last_day = today_str
-            if last_hour != hour_str:
-                predictions_hour = 0
-                last_hour = hour_str
-            # Vérification
-            if predictions_today >= limit_per_day:
-                await update.message.reply_text(f"🚫 Limite de prédictions par jour atteinte ({limit_per_day}).")
-                return
-            if predictions_hour >= limit_per_hour:
-                await update.message.reply_text(f"🚫 Limite de prédictions par heure atteinte ({limit_per_hour}).")
-                return
-            if predictions_total >= limit_total:
-                await update.message.reply_text(f"🚫 Limite totale de prédictions atteinte ({limit_total}).")
-                return
+                print(f"[DEBUG] Pas de limite définie, réinitialisation du compteur")
+            else:
+                # Reset si changement de jour
+                if last_day != today_str:
+                    predictions_today = 0
+                    last_day = today_str
+                    print(f"[DEBUG] Nouveau jour, réinitialisation du compteur")
+                
+                # Vérification AVANT d'incrémenter
+                if predictions_today >= limit_per_day:
+                    print(f"[DEBUG] Limite atteinte: {predictions_today}/{limit_per_day}")
+                    await update.message.reply_text(f"🚫 Limite de prédictions par jour atteinte ({limit_per_day}).")
+                    return
+            
             # Incrémentation
             predictions_today += 1
-            predictions_hour += 1
-            predictions_total += 1
+            print(f"[DEBUG] Après incrémentation: {predictions_today}/{limit_per_day}")
+            
+            # Mise à jour de la base de données
+            cursor.execute("""
+                UPDATE user_access 
+                SET predictions_today = ?, 
+                    last_prediction_day = ? 
+                WHERE user_id = ?
+            """, (predictions_today, today_str, user_id))
+            
+            conn.commit()
+            print(f"[DEBUG] Base de données mise à jour avec succès")
+            
+            # Vérification après mise à jour
+            cursor.execute("""
+                SELECT predictions_today, last_prediction_day 
+                FROM user_access 
+                WHERE user_id = ?
+            """, (user_id,))
+            verify_row = cursor.fetchone()
+            print(f"[DEBUG] Vérification après mise à jour:")
+            print(f"predictions_today = {verify_row[0]}")
+            print(f"last_prediction_day = {verify_row[1]}")
+            
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            print(f"[ERROR] Erreur dans predire_auto pour user {user_id}: {e}")
+            await update.message.reply_text(f"❌ Erreur lors de la vérification des limites : {e}")
+            return
+        finally:
+            if conn:
+                conn.close()
 
-        cursor.execute("UPDATE user_access SET predictions_today=?, last_prediction_day=?, predictions_hour=?, last_prediction_hour=?, predictions_total=? WHERE user_id=?", (predictions_today, last_day, predictions_hour, last_hour, predictions_total, user_id))
-        conn.commit()
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        await update.message.reply_text(f"Erreur lors de la vérification des limites : {e}")
-        return
-    finally:
-        if conn:
-            conn.close()
     if update.message.text and "prédire" in update.message.text.lower():
         context.user_data.pop("bet_amount", None)
     if "id_1xbet" not in context.user_data:
         await update.message.reply_text(
             "Pour une simulation personnalisée, entre ton ID utilisateur 1xbet, puis clique sur OK pour confirmer (ou NON pour une simulation totalement aléatoire).",
             reply_markup=ReplyKeyboardMarkup(
-                [[KeyboardButton("OK")], [KeyboardButton("NON")]],
+                [[KeyboardButton("OK")], [KeyboardButton("NON")], [KeyboardButton("Annuler")]],
                 resize_keyboard=True
             )
         )
@@ -1207,72 +1251,51 @@ async def predire_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if bet_amount_for_rng is None:
         await update.message.reply_text(
             "Entre le montant de ton pari (ex: 100, 50.5) :",
-            reply_markup=ReplyKeyboardMarkup([["200", "300", "400"], ["500", "750", "1000"]], resize_keyboard=True)
+            reply_markup=ReplyKeyboardMarkup([
+                ["200", "300", "400"], ["500", "750", "1000"], ["Annuler"]
+            ], resize_keyboard=True)
         )
         return ASK_BET_AMOUNT
 
     rng, seed_str = get_rng(user_id_1xbet, bet_amount_for_rng)
+    # LOG du seed utilisé pour la prédiction
+    logging.info(f"[PREDICTION] user_id={user_id} | montant={bet_amount_for_rng} | datetime={datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')} | seed_utilise={seed_str}")
+
+    # Affichage temporaire d'une partie du calcul (extrait du seed)
+    calcul_msg = f"⏳ Calcul en cours...\nAperçu : ...{seed_str[-8:]}"
+    temp_message = await update.message.reply_text(calcul_msg)
+    await asyncio.sleep(5)
+    try:
+        await temp_message.delete()
+    except Exception:
+        pass
+
     context.user_data["auto_preds"] = []
     pred_msgs = []
     sides_ref = ["gauche", "droite"]
 
-    seed_logs = []
-    if user_id_1xbet or bet_amount_for_rng:
-        seed_logs.append(f"🧮 Logs de calcul du seed :")
-        seed_logs.append(f"Seed utilisé : {seed_str}")
-        seed_components = []
-        if user_id_1xbet:
-            seed_components.append(f'"{user_id_1xbet}"')
-        if bet_amount_for_rng is not None:
-            seed_components.append(f'"{bet_amount_for_rng}"')
-        if user_id_1xbet is not None or bet_amount_for_rng is not None:
-            now = datetime.datetime.now()
-            now_str_log = now.strftime("%Y%m%d_%H%M%S_%f")
-            seed_components.append(f'"{now_str_log}"')
-
-        log_seed = "_".join(c.strip("'\"") for c in seed_components)
-        seed_logs.append(f'random = random.Random("{log_seed}")')
-
+    # Nouvelle logique d'affichage grille
+    grille_lines = []
     for i, cote in enumerate(COTES):
         tirage_case = rng.choice([1, 2, 3, 4, 5])
         tirage_sens = rng.choice(sides_ref)
         case = str(tirage_case)
         side_ref = tirage_sens
         context.user_data["auto_preds"].append({"cote": cote, "case": case, "side_ref": side_ref})
-        pred_msgs.append(
-            f"Prédiction cote {cote} : sélectionne la case {case} (en comptant depuis la {side_ref})"
-        )
-        
-        # Envoi de l'image correspondante
-        image_path = os.path.join(IMAGES_DIR, f"case{case}_{side_ref}.{IMAGE_EXT}")
-        
-        if os.path.exists(image_path):
-            with open(image_path, "rb") as img:
-                await update.message.reply_photo(
-                    photo=img,
-                    caption=f"Case {case} ({side_ref}) pour la cote {cote}"
-                )
-        else:
-            await update.message.reply_text(
-                f"⚠️ Image non disponible pour la case {case} ({side_ref})"
-            )
+        # Construction de la ligne grille
+        idx = tirage_case - 1 if side_ref == "gauche" else 5 - tirage_case
+        line = ["🟠"] * 5
+        line[idx] = "🍎"
+        grille_lines.append(f"Cote {cote} : {''.join(line)}")
 
-    if user_id_1xbet is not None or bet_amount_for_rng is not None:
-        await update.message.reply_text(
-            "\n".join(seed_logs)
-        )
-        await update.message.reply_text(
-            "Voici la séquence calculée pour ce seed :\n" + "\n".join(pred_msgs)
-        )
-    else:
-        await update.message.reply_text(
-            "🍏 Séquence automatique (simulation 1xbet)\n\n" + "\n".join(pred_msgs)
-        )
+    # Affichage du message grille
+    msg = "Signal reçu✔️\n" + "\n".join(grille_lines)
+    await update.message.reply_text(msg)
 
     await update.message.reply_text(
         "Après avoir joué sur 1xbet, indique si tu as GAGNÉ ou PERDU la séquence (gagné si tu as eu 'Bonne' pour les 2 cotes, sinon perdu).",
         reply_markup=ReplyKeyboardMarkup(
-            [[KeyboardButton("🏆 Gagné"), KeyboardButton("💥 Perdu")]],
+            [[KeyboardButton("🏆 Gagné"), KeyboardButton("💥 Perdu")], [KeyboardButton("Annuler")]],
             resize_keyboard=True)
     )
     return ASK_RESULTS
@@ -1283,13 +1306,16 @@ async def ask_1xbet_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔️ Accès refusé. Merci de demander un code d'accès à l'administrateur.")
         return
     text = update.message.text.strip()
+    if text.lower() == "annuler":
+        await update.message.reply_text("Opération annulée.", reply_markup=get_main_menu())
+        return ConversationHandler.END
     if text.upper() == "NON":
         context.user_data["id_1xbet"] = None
         context.user_data.pop("awaiting_id", None)
         context.user_data.pop("temp_id", None)
         await update.message.reply_text(
             "Entre le montant de ton pari (ex: 100, 50.5) :",
-            reply_markup=ReplyKeyboardMarkup([["200", "300", "400"], ["500", "750", "1000"]], resize_keyboard=True)
+            reply_markup=ReplyKeyboardMarkup([["200", "300", "400"], ["500", "750", "1000"], ["Annuler"]], resize_keyboard=True)
         )
         return ASK_BET_AMOUNT
     elif text.upper() == "OK":
@@ -1306,7 +1332,7 @@ async def ask_1xbet_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("temp_id", None)
         await update.message.reply_text(
             "Entre le montant de ton pari (ex: 100, 50.5) :",
-            reply_markup=ReplyKeyboardMarkup([["200", "300", "400"], ["500", "750", "1000"]], resize_keyboard=True)
+            reply_markup=ReplyKeyboardMarkup([["200", "300", "400"], ["500", "750", "1000"], ["Annuler"]], resize_keyboard=True)
         )
         return ASK_BET_AMOUNT
     else:
@@ -1321,7 +1347,7 @@ async def ask_1xbet_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"ID entré : {text}\nClique sur OK pour confirmer ou NON pour annuler.",
                 reply_markup=ReplyKeyboardMarkup(
-                    [[KeyboardButton("OK")], [KeyboardButton("NON")]],
+                    [[KeyboardButton("OK")], [KeyboardButton("NON")], [KeyboardButton("Annuler")]],
                     resize_keyboard=True
                 )
             )
@@ -1333,6 +1359,9 @@ async def collect_bet_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("⛔️ Accès refusé. Merci de demander un code d'accès à l'administrateur.")
         return
     bet_amount_str = update.message.text.strip()
+    if bet_amount_str.lower() == "annuler":
+        await update.message.reply_text("Opération annulée.", reply_markup=get_main_menu())
+        return ConversationHandler.END
     try:
         bet_amount_float = float(bet_amount_str)
         if bet_amount_float <= 0:
@@ -1351,6 +1380,9 @@ async def after_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔️ Accès refusé. Merci de demander un code d'accès à l'administrateur.")
         return
     result_text = update.message.text.lower()
+    if result_text == "annuler":
+        await update.message.reply_text("Opération annulée.", reply_markup=get_main_menu())
+        return ConversationHandler.END
     if "gagné" in result_text or "gagne" in result_text:
         context.user_data['auto_result'] = "gagne"
     elif "perdu" in result_text:
@@ -1363,7 +1395,7 @@ async def after_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["auto_case_step"] = 0
     await update.message.reply_text(
         f"Pour la cote {COTES[0]}, sur quelle case étais-tu ? (1, 2, 3, 4 ou 5)",
-        reply_markup=ReplyKeyboardMarkup([[KeyboardButton(c) for c in POSITIONS]], resize_keyboard=True)
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton(c) for c in POSITIONS], [KeyboardButton("Annuler")]], resize_keyboard=True)
     )
     return ASK_CASES
 
@@ -1373,6 +1405,9 @@ async def collect_case(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔️ Accès refusé. Merci de demander un code d'accès à l'administrateur.")
         return
     case = update.message.text.strip()
+    if case.lower() == "annuler":
+        await update.message.reply_text("Opération annulée.", reply_markup=get_main_menu())
+        return ConversationHandler.END
     if case not in POSITIONS:
         await update.message.reply_text("Merci d'entrer un numéro de case valide : 1, 2, 3, 4 ou 5.")
         return ASK_CASES
@@ -1383,7 +1418,7 @@ async def collect_case(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["auto_case_step"] = step + 1
     await update.message.reply_text(
         f"As-tu joué à GAUCHE ou à DROITE de la case {case} pour la cote {COTES[step]} (prédiction à compter depuis la {side_ref}) ?",
-        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Gauche"), KeyboardButton("Droite")]], resize_keyboard=True)
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Gauche"), KeyboardButton("Droite")], [KeyboardButton("Annuler")]], resize_keyboard=True)
     )
     return ASK_SIDE
 
@@ -1393,6 +1428,9 @@ async def collect_side(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔️ Accès refusé. Merci de demander un code d'accès à l'administrateur.")
         return
     side = update.message.text.strip().capitalize()
+    if side.lower() == "annuler":
+        await update.message.reply_text("Opération annulée.", reply_markup=get_main_menu())
+        return ConversationHandler.END
     if side not in SIDES:
         await update.message.reply_text("Merci de répondre par 'Gauche' ou 'Droite'.")
         return ASK_SIDE
@@ -1402,7 +1440,7 @@ async def collect_side(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["auto_case_details"][step-1]["side"] = side
         await update.message.reply_text(
             f"La case {context.user_data['auto_case_details'][step-1]['case']} ({side}) pour la cote {COTES[step-1]}, était-elle Bonne ou Mauvaise ?",
-            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Bonne"), KeyboardButton("Mauvaise")]], resize_keyboard=True)
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Bonne"), KeyboardButton("Mauvaise")], [KeyboardButton("Annuler")]], resize_keyboard=True)
         )
         return ASK_BONNE_MAUVAISE
     else:
@@ -1419,6 +1457,9 @@ async def collect_bonne_mauvaise(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("⛔️ Accès refusé. Merci de demander un code d'accès à l'administrateur.")
         return
     reponse = update.message.text.strip().lower()
+    if reponse == "annuler":
+        await update.message.reply_text("Opération annulée.", reply_markup=get_main_menu())
+        return ConversationHandler.END
     if reponse not in ["bonne", "mauvaise"]:
         await update.message.reply_text("Merci de répondre par 'Bonne' ou 'Mauvaise'.")
         return ASK_BONNE_MAUVAISE
@@ -1444,7 +1485,7 @@ async def collect_bonne_mauvaise(update: Update, context: ContextTypes.DEFAULT_T
     if step < len(COTES):
         await update.message.reply_text(
             f"Pour la cote {COTES[step]}, sur quelle case étais-tu ? (1, 2, 3, 4 ou 5)",
-            reply_markup=ReplyKeyboardMarkup([[KeyboardButton(c) for c in POSITIONS]], resize_keyboard=True)
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton(c) for c in POSITIONS], [KeyboardButton("Annuler")]], resize_keyboard=True)
         )
         return ASK_CASES
 
@@ -1721,10 +1762,14 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         msg = "Liste des utilisateurs :\n"
         for user_id, name, username, expiration, suspended in rows:
+            # Cherche le code d'accès non utilisé le plus récent pour cet utilisateur
+            cursor.execute("SELECT code FROM access_codes WHERE for_user_id = ? AND used = 0 AND expiration > datetime('now') ORDER BY expiration DESC LIMIT 1", (user_id,))
+            code_row = cursor.fetchone()
+            code_str = code_row[0] if code_row else "-"
             statut = "Actif" if (suspended is None or suspended == 0) else "Suspendu"
             name = name or "-"
             username = f"@{username}" if username else "-"
-            msg += f"- {user_id} | {name} ({username}) | Expire : {expiration} | {statut}\n"
+            msg += f"- {user_id} | {name} ({username}) | Expire : {expiration} | {statut} | Code accès : {code_str}\n"
         await update.message.reply_text(msg)
     except Exception as e:
         await update.message.reply_text(f"Erreur lors de la récupération des utilisateurs : {e}")
@@ -1739,114 +1784,89 @@ async def user_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔️ Accès refusé. Merci de demander un code d'accès à l'administrateur.")
         return
     msg = (
-        "📋 Commandes utilisateur disponibles :\n"
-        "\n"
-        "/start\n"
-        "  Affiche le menu principal du bot.\n"
-        "/mon_acces ou /my_access\n"
-        "  Affiche la date d'expiration et le statut de ton accès.\n"
-        "/fonctionnement\n"
-        "  Explication du fonctionnement du jeu et du bot.\n"
-        "/conseils\n"
-        "  Conseils pour jouer de façon responsable.\n"
-        "/arnaques\n"
-        "  Mise en garde contre les arnaques.\n"
-        "/contact\n"
-        "  Informations de contact et aide.\n"
-        "/faq\n"
-        "  Foire aux questions.\n"
-        "/tuto\n"
-        "  Tutoriel rapide pour utiliser le bot.\n"
-        "/apropos\n"
-        "  À propos du bot.\n"
-        "/historique\n"
-        "  Voir ton historique de parties.\n"
-        "/statistiques ou /stats\n"
-        "  Voir tes statistiques personnelles.\n"
-        "/import\n"
-        "  Importer un historique.\n"
-        "Boutons du menu :\n"
-        "  🍏 Prédire : Lancer une prédiction.\n"
-        "  📤 Exporter : Exporter ton historique.\n"
-        "  📥 Importer : Importer un historique.\n"
-        "  ♻️ Réinitialiser historique : Supprimer tout ton historique.\n"
-        "  🔄 Réinitialiser choix : Réinitialiser tes choix de prédiction.\n"
+        "📋 Commandes utilisateur disponibles :\n\n"
+        
+        "1. 🏠 Commandes de Base :\n"
+        "/start - Affiche le menu principal du bot\n"
+        "/mon_acces ou /my_access - Affiche la date d'expiration et le statut de ton accès\n"
+        "/apropos - À propos du bot\n\n"
+        
+        "2. 📚 Informations & Aide :\n"
+        "/fonctionnement - Explication du fonctionnement du jeu et du bot\n"
+        "/conseils - Conseils pour jouer de façon responsable\n"
+        "/arnaques - Mise en garde contre les arnaques\n"
+        "/faq - Foire aux questions\n"
+        "/tuto - Tutoriel rapide pour utiliser le bot\n"
+        "/contact - Informations de contact et aide\n\n"
+        
+        "3. 📊 Statistiques & Historique :\n"
+        "/historique - Voir ton historique de parties\n"
+        "/statistiques ou /stats - Voir tes statistiques personnelles\n\n"
+        
+        "4. 📥 Gestion des Données :\n"
+        "/import - Importer un historique\n\n"
+        
+        "5. 🎮 Boutons du Menu Principal :\n"
+        "🍏 Prédire - Lancer une prédiction\n"
+        "📤 Exporter - Exporter ton historique\n"
+        "📥 Importer - Importer un historique\n"
+        "♻️ Réinitialiser historique - Supprimer tout ton historique\n"
+        "🔄 Réinitialiser choix - Réinitialiser tes choix de prédiction\n"
     )
     await update.message.reply_text(msg)
 
 # Commande admin pour afficher toutes les commandes admin disponibles
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche l'aide pour les commandes administrateur."""
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
         return
     msg = (
-        "🛡 Commandes administrateur disponibles :\n"
-        "\n"
-        "/gen_code <user_id> <minutes>\n"
-        "  Génère un code d'accès temporaire pour un utilisateur.\n"
-        "/db_info\n"
-        "  Affiche la structure des tables d'accès.\n"
-        "/list_users\n"
-        "  Affiche la liste de tous les utilisateurs ayant un accès.\n"
-        "/list_all_users\n"
-        "  Affiche la liste de tous les utilisateurs enregistrés (même sans accès).\n"
-        "/export_all_users\n"
-        "  Exporte la liste de tous les utilisateurs (user_id, nom, username) en TXT.\n"
-        "/suspend_user <user_id>\n"
-        "  Suspend l'accès d'un utilisateur (le bloque).\n"
-        "/unsuspend_user <user_id>\n"
-        "  Réactive l'accès d'un utilisateur suspendu.\n"
-        "/extend_access <user_id> <minutes|2h|3j|15m>\n"
-        "  Prolonge la durée d'accès d'un utilisateur. Accepte aussi 2h, 3j, 15m, etc.\n"
-        "/reduce_access <user_id> <minutes|2h|3j|15m>\n"
-        "  Réduit la durée d'accès d'un utilisateur. Accepte aussi 2h, 3j, 15m, etc.\n"
-        "/set_access <user_id> <YYYY-MM-DD HH:MM:SS>\n"
-        "  Définit une nouvelle date d'expiration pour l'accès d'un utilisateur.\n"
-        "/set_limit <user_id> <par_jour> <par_heure> <total>\n"
-        "  Définit des limites personnalisées de prédiction pour un utilisateur.\n"
-        "/user_status <user_id>\n"
-        "  Affiche le statut, les quotas et les 10 dernières prédictions d'un utilisateur.\n"
-        "/user_history <user_id>\n"
-        "  Exporte tout l'historique d'un utilisateur en TXT.\n"
-        "/user_email <user_id>\n"
-        "  Exporte l'email, le nom et le username d'un utilisateur en TXT.\n"
-        "\n"
-        "\U0001F4BE /backup_db\n"
-        "  Sauvegarde manuelle de la base de données (fichier .db envoyé à l'admin).\n"
-        "/restore_db\n"
-        "  Restaure la base de données à partir d'un fichier .db (nécessite confirmation).\n"
-        "\n"
-        "\U0001F4C1 Sauvegarde automatique :\n"
-        "  À chaque démarrage, une sauvegarde de la base est créée dans le dossier backups/.\n"
-        "  Les 20 dernières sauvegardes sont conservées automatiquement.\n"
-        "\n"
-        "\U0001F50D /admin_logs\n"
-        "  Affiche les 50 dernières actions administrateur (journalisation automatique).\n"
-        "  Toutes les actions admin sensibles sont enregistrées dans le fichier admin_actions.log (dans le dossier du bot).\n"
-        "\n"
-        "Nettoyage automatique :\n"
-        "  Les codes d'accès expirés non utilisés sont supprimés automatiquement au démarrage et lors de chaque génération/activation de code.\n"
-        "\n"
-        "Mise à jour automatique :\n"
-        "  Le nom et le username de chaque utilisateur sont désormais mis à jour à chaque interaction (message ou bouton).\n"
-        "/find_user <username|email>\n"
-        "  Recherche un utilisateur par username ou email (affiche l'user_id, nom, username, email).\n"
-        "/user_stats <user_id>\n"
-        "  Statistiques avancées sur l'activité d'un utilisateur (séquences, taux, jours actifs, etc.).\n"
-        "/set_role <user_id> <role>\n"
-        "  Définit le rôle d'un utilisateur (admin, vip, test, user).\n"
-        "/my_role\n"
-        "  Permet à l'utilisateur de voir son rôle actuel.\n"
-        "\n"
-        "Système de rôles :\n"
-        "  - admin : accès total, gestion du bot\n"
-        "  - vip : accès privilégié\n"
-        "  - test : accès temporaire ou test\n"
-        "  - user : accès standard\n"
-        "/reset_access <user_id>\n"
-        "  Réinitialise l'expiration de l'utilisateur à +30 jours à partir de maintenant.\n"
-        "/delete_user <user_id>\n"
-        "  Supprime complètement l'utilisateur de toutes les tables (attention, action irréversible !).\n"
+        "🛡 Commandes administrateur disponibles :\n\n"
+        
+        "1. 👥 Gestion des Utilisateurs :\n"
+        "/gen_code <user_id> <minutes> - Génère un code d'accès temporaire\n"
+        "/list_users - Liste des utilisateurs avec accès\n"
+        "/list_all_users - Liste de tous les utilisateurs\n"
+        "/suspend_user <user_id> - Suspendre un utilisateur\n"
+        "/unsuspend_user <user_id> - Réactiver un utilisateur\n"
+        "/extend_access <user_id> <minutes|2h|3j|15m> - Prolonger l'accès\n"
+        "/reduce_access <user_id> <minutes|2h|3j|15m> - Réduire l'accès\n"
+        "/set_access <user_id> <YYYY-MM-DD HH:MM:SS> - Définir une date d'expiration\n"
+        "/delete_user <user_id> - Supprimer un utilisateur\n\n"
+        
+        "2. 📊 Statistiques & Rapports :\n"
+        "/user_status <user_id> - Statut et quotas d'un utilisateur\n"
+        "/user_history <user_id> - Historique complet d'un utilisateur\n"
+        "/user_stats <user_id> - Statistiques avancées\n"
+        "/top_users [N] - Top N utilisateurs les plus actifs\n"
+        "/usage_report - Rapport global d'utilisation\n"
+        "/global_stats - Statistiques globales\n\n"
+        
+        "3. 💾 Maintenance & Base de Données :\n"
+        "/db_info - Structure des tables\n"
+        "/backup_db - Sauvegarde de la base\n"
+        "/restore_db - Restauration de la base\n"
+        "/admin_logs - Journal des actions admin\n\n"
+        
+        "4. ⚙️ Configuration & Rôles :\n"
+        "/set_role <user_id> <role> - Définir un rôle (admin/vip/test/user)\n"
+        "/set_limit <user_id> <nombre> - Définir le nombre de prédictions par jour\n"
+        "/my_role - Voir son rôle actuel\n\n"
+        
+        "5. 🔔 Notifications & Automatisation :\n"
+        "/broadcast <message> - Message global à tous les utilisateurs\n"
+        "/auto_suspend - Suspension automatique des utilisateurs\n"
+        "/auto_notify <règle> - Notifications automatiques\n\n"
+        
+        "6. 🛠 Outils de Développement :\n"
+        "/test_rng [seed] - Tester le générateur aléatoire\n"
+        "/find_user <username|email> - Rechercher un utilisateur\n\n"
+        
+        "📝 Notes :\n"
+        "- Les codes d'accès expirés sont nettoyés automatiquement\n"
+        "- Les noms d'utilisateurs sont mis à jour à chaque interaction\n"
+        "- Les sauvegardes sont automatiques (20 dernières conservées)\n"
     )
     await update.message.reply_text(msg)
 
@@ -2013,30 +2033,68 @@ async def set_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Commande admin pour définir les limites personnalisées d'un utilisateur
 async def set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_admin_action("SET_LIMIT", admin_id=update.effective_user.id, details=f"args={context.args}")
+    """Définit la limite de prédictions quotidiennes pour un utilisateur."""
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
         return
-    if len(context.args) != 4:
-        await update.message.reply_text("Utilisation : /set_limit <user_id> <par_jour> <par_heure> <total>")
+    
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Usage: /set_limit <user_id> <nombre_prédictions>\n"
+            "Exemple: /set_limit 123456789 50"
+        )
         return
-    user_id, per_day, per_hour, total = context.args
+    
+    user_id = context.args[0]
     try:
-        per_day = int(per_day)
-        per_hour = int(per_hour)
-        total = int(total)
+        limit = int(context.args[1])
+        if limit < 0:
+            await update.message.reply_text("❌ Le nombre de prédictions doit être positif.")
+            return
     except ValueError:
-        await update.message.reply_text("Les limites doivent être des entiers.")
+        await update.message.reply_text("❌ Le nombre de prédictions doit être un nombre entier.")
         return
+    
     conn = None
     try:
         conn = sqlite3.connect(DATABASE_FILE)
         cursor = conn.cursor()
-        cursor.execute("UPDATE user_access SET limit_per_day=?, limit_per_hour=?, limit_total=? WHERE user_id=?", (per_day, per_hour, total, user_id))
+        
+        # Vérifier si l'utilisateur existe dans user_access
+        cursor.execute("SELECT user_id FROM user_access WHERE user_id = ?", (user_id,))
+        if not cursor.fetchone():
+            # Si l'utilisateur n'existe pas dans user_access, on le crée
+            cursor.execute("""
+                INSERT INTO user_access (user_id, limit_per_day, predictions_today, last_prediction_day)
+                VALUES (?, ?, 0, datetime('now'))
+            """, (user_id, limit))
+        else:
+            # Si l'utilisateur existe, on met à jour sa limite et on réinitialise le compteur
+            cursor.execute("""
+                UPDATE user_access 
+                SET limit_per_day = ?, 
+                    predictions_today = 0,
+                    last_prediction_day = datetime('now')
+                WHERE user_id = ?
+            """, (limit, user_id))
+        
         conn.commit()
-        await update.message.reply_text(f"Limites personnalisées pour {user_id} : {per_day}/jour, {per_hour}/heure, {total}/total.")
+        
+        # Notifier l'utilisateur
+        try:
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=f"✅ Votre limite de prédictions a été mise à jour : {limit} prédictions par jour"
+            )
+        except Exception:
+            pass
+        
+        await update.message.reply_text(f"✅ Limite de {user_id} mise à jour : {limit} prédictions par jour")
+        
     except Exception as e:
-        await update.message.reply_text(f"Erreur lors de la modification des limites : {e}")
+        if conn:
+            conn.rollback()
+        await update.message.reply_text(f"❌ Erreur : {e}")
     finally:
         if conn:
             conn.close()
@@ -2746,6 +2804,21 @@ def main():
     application.add_handler(CommandHandler("reset_access", reset_access))
     application.add_handler(CommandHandler("delete_user", delete_user))
 
+    # Ajout des commandes automatisées avancées
+    application.add_handler(CommandHandler("auto_suspend", auto_suspend))
+    application.add_handler(CommandHandler("auto_notify", auto_notify))
+
+    # Ajout des commandes statistiques avancées
+    application.add_handler(CommandHandler("top_users", top_users))
+    application.add_handler(CommandHandler("usage_report", usage_report))
+    application.add_handler(CommandHandler("global_stats", global_stats))
+
+    # Ajout de la commande test_rng
+    application.add_handler(CommandHandler("test_rng", test_rng))
+
+    # Ajout de la commande broadcast
+    application.add_handler(CommandHandler("broadcast", broadcast))
+
     print("Bot démarré et base de données initialisée...")
     application.run_polling()
 
@@ -2769,25 +2842,398 @@ async def set_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
         return
     if len(context.args) != 2:
-        await update.message.reply_text("Utilisation : /set_role <user_id> <role> (admin, vip, test, user)")
+        await update.message.reply_text("Utilisation : /set_role <user_id> <role>")
         return
-    user_id, role = context.args
-    role = role.lower()
-    if role not in ["admin", "vip", "test", "user"]:
-        await update.message.reply_text("Rôle invalide. Choisis parmi : admin, vip, test, user.")
+    
+    user_id, new_role = context.args
+    if new_role not in ["admin", "vip", "test", "user"]:
+        await update.message.reply_text("Rôle invalide. Utilisez : admin, vip, test, ou user")
+        return
+    
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        
+        # Récupérer l'ancien rôle
+        cursor.execute("SELECT role FROM users WHERE user_id = ?", (user_id,))
+        result = cursor.fetchone()
+        if not result:
+            await update.message.reply_text("Utilisateur non trouvé.")
+            return
+        
+        old_role = result[0]
+        
+        # Mettre à jour le rôle
+        cursor.execute("UPDATE users SET role = ? WHERE user_id = ?", (new_role, user_id))
+        conn.commit()
+        
+        # Notifier l'utilisateur
+        details = f"Passage de {old_role} à {new_role}"
+        await notify_user_action(user_id, "role_change", details, context)
+        
+        await update.message.reply_text(f"Rôle de l'utilisateur {user_id} modifié de {old_role} à {new_role}")
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors du changement de rôle : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def extend_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    if len(context.args) != 2:
+        await update.message.reply_text("Utilisation : /extend_access <user_id> <minutes|2h|3j|15m>")
+        return
+    
+    user_id, duration = context.args
+    try:
+        minutes = parse_flexible_duration(duration)
+    except Exception as e:
+        await update.message.reply_text(f"Format de durée invalide : {e}")
+        return
+    
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        
+        # Récupérer l'ancienne date d'expiration
+        cursor.execute("SELECT expiration FROM user_access WHERE user_id = ?", (user_id,))
+        result = cursor.fetchone()
+        if not result:
+            await update.message.reply_text("Utilisateur non trouvé.")
+            return
+        
+        old_expiration = datetime.datetime.strptime(result[0], "%Y-%m-%d %H:%M:%S")
+        new_expiration = old_expiration + datetime.timedelta(minutes=minutes)
+        
+        # Mettre à jour l'expiration
+        cursor.execute("UPDATE user_access SET expiration = ? WHERE user_id = ?", 
+                      (new_expiration.strftime("%Y-%m-%d %H:%M:%S"), user_id))
+        conn.commit()
+        
+        # Notifier l'utilisateur
+        details = f"Accès prolongé jusqu'au {new_expiration.strftime('%d/%m/%Y %H:%M')}"
+        await notify_user_action(user_id, "access_extended", details, context)
+        
+        await update.message.reply_text(f"Accès de l'utilisateur {user_id} prolongé jusqu'au {new_expiration.strftime('%d/%m/%Y %H:%M')}")
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de la prolongation : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def suspend_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Utilisation : /suspend_user <user_id>")
+        return
+    
+    user_id = context.args[0]
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE user_access SET suspended = 1 WHERE user_id = ?", (user_id,))
+        conn.commit()
+        
+        # Notifier l'utilisateur
+        await notify_user_action(user_id, "suspended", None, context)
+        
+        await update.message.reply_text(f"Utilisateur {user_id} suspendu.")
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de la suspension : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def unsuspend_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Utilisation : /unsuspend_user <user_id>")
+        return
+    
+    user_id = context.args[0]
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE user_access SET suspended = 0 WHERE user_id = ?", (user_id,))
+        conn.commit()
+        
+        # Notifier l'utilisateur
+        await notify_user_action(user_id, "unsuspended", None, context)
+        
+        await update.message.reply_text(f"Utilisateur {user_id} réactivé.")
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de la réactivation : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def auto_suspend(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
         return
     conn = None
     try:
         conn = sqlite3.connect(DATABASE_FILE)
         cursor = conn.cursor()
-        cursor.execute("UPDATE users SET role = ? WHERE user_id = ?", (role, user_id))
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute("SELECT user_id, predictions_today, limit_per_day, predictions_hour, limit_per_hour, predictions_total, limit_total, suspended FROM user_access")
+        rows = cursor.fetchall()
+        suspended_count = 0
+        for row in rows:
+            user_id, pred_today, lim_day, pred_hour, lim_hour, pred_total, lim_total, suspended = row
+            lim_day = lim_day if lim_day is not None else MAX_PREDICTIONS_PER_DAY
+            lim_hour = lim_hour if lim_hour is not None else MAX_PREDICTIONS_PER_HOUR
+            lim_total = lim_total if lim_total is not None else MAX_PREDICTIONS_TOTAL
+            if (pred_today is not None and pred_today >= lim_day) or (pred_hour is not None and pred_hour >= lim_hour) or (pred_total is not None and pred_total >= lim_total):
+                if suspended is None or suspended == 0:
+                    cursor.execute("UPDATE user_access SET suspended = 1 WHERE user_id = ?", (user_id,))
+                    try:
+                        await context.bot.send_message(chat_id=int(user_id), text="🚫 Tu as dépassé tes quotas. Ton accès a été suspendu automatiquement. Contacte l'administrateur si besoin.")
+                    except Exception as e:
+                        logger.warning(f"Impossible de notifier l'utilisateur {user_id} de la suspension auto : {e}")
+                    suspended_count += 1
         conn.commit()
-        await update.message.reply_text(f"Rôle de l'utilisateur {user_id} mis à jour : {role}")
+        await update.message.reply_text(f"{suspended_count} utilisateur(s) suspendu(s) automatiquement pour dépassement de quotas.")
     except Exception as e:
-        await update.message.reply_text(f"Erreur lors de la modification du rôle : {e}")
+        await update.message.reply_text(f"Erreur lors de l'auto-suspension : {e}")
     finally:
         if conn:
             conn.close()
+
+async def auto_notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    if len(context.args) < 1:
+        await update.message.reply_text("Utilisation : /auto_notify <règle>\nExemples de règles : quota, expiration")
+        return
+    rule = context.args[0].lower()
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        notified = 0
+        if rule == "quota":
+            cursor.execute("SELECT user_id, predictions_today, limit_per_day FROM user_access")
+            for user_id, pred_today, lim_day in cursor.fetchall():
+                lim_day = lim_day if lim_day is not None else MAX_PREDICTIONS_PER_DAY
+                if pred_today is not None and lim_day > 0 and pred_today >= lim_day - 1:
+                    try:
+                        await context.bot.send_message(chat_id=int(user_id), text=f"⚠️ Attention : tu as presque atteint ta limite quotidienne de prédictions ({pred_today}/{lim_day}).")
+                        notified += 1
+                    except Exception as e:
+                        logger.warning(f"Impossible de notifier l'utilisateur {user_id} (quota) : {e}")
+        elif rule == "expiration":
+            cursor.execute("SELECT user_id, expiration FROM user_access")
+            for user_id, expiration in cursor.fetchall():
+                if expiration:
+                    exp_dt = datetime.datetime.strptime(expiration, "%Y-%m-%d %H:%M:%S")
+                    now_dt = datetime.datetime.now()
+                    delta = exp_dt - now_dt
+                    if 0 < delta.total_seconds() < 2*24*3600:
+                        try:
+                            await context.bot.send_message(chat_id=int(user_id), text=f"⏰ Ton accès expire bientôt ({expiration}). Pense à demander un renouvellement.")
+                            notified += 1
+                        except Exception as e:
+                            logger.warning(f"Impossible de notifier l'utilisateur {user_id} (expiration) : {e}")
+        else:
+            await update.message.reply_text("Règle inconnue. Utilise 'quota' ou 'expiration'.")
+            return
+        await update.message.reply_text(f"{notified} utilisateur(s) notifié(s) pour la règle '{rule}'.")
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de l'auto-notification : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def top_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    limit = 10
+    if context.args and context.args[0].isdigit():
+        limit = int(context.args[0])
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT h.user_id, u.name, u.username, COUNT(*)/2 as seqs
+            FROM history h
+            LEFT JOIN users u ON h.user_id = u.user_id
+            GROUP BY h.user_id
+            ORDER BY seqs DESC
+            LIMIT ?
+        """, (limit,))
+        rows = cursor.fetchall()
+        if not rows:
+            await update.message.reply_text("Aucun utilisateur trouvé.")
+            return
+        msg = f"🏆 Top {limit} utilisateurs (par séquences jouées) :\n"
+        for i, (user_id, name, username, seqs) in enumerate(rows, 1):
+            name = name or "-"
+            username = f"@{username}" if username else "-"
+            msg += f"{i}. {user_id} | {name} ({username}) : {int(seqs)} séquences\n"
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def usage_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM history")
+        total_entries = cursor.fetchone()[0]
+        total_sequences = total_entries // 2
+        cursor.execute("SELECT COUNT(DISTINCT user_id) FROM history")
+        total_users = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM users")
+        registered_users = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM user_access WHERE expiration > ?", (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),))
+        active_access = cursor.fetchone()[0]
+        msg = (
+            f"📈 Rapport d'utilisation global :\n"
+            f"- Séquences totales jouées : {total_sequences}\n"
+            f"- Utilisateurs ayant joué : {total_users}\n"
+            f"- Utilisateurs enregistrés : {registered_users}\n"
+            f"- Accès actifs : {active_access}\n"
+        )
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def global_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        # Taux de victoire global par cote
+        cursor.execute("SELECT cote, resultat, COUNT(*) FROM history WHERE resultat IN ('Bonne','Mauvaise') GROUP BY cote, resultat")
+        results = cursor.fetchall()
+        victoire_123 = victoire_154 = defaites_123 = defaites_154 = 0
+        for cote, resultat, count in results:
+            if cote == "1.23":
+                if resultat == "Bonne":
+                    victoire_123 = count
+                elif resultat == "Mauvaise":
+                    defaites_123 = count
+            elif cote == "1.54":
+                if resultat == "Bonne":
+                    victoire_154 = count
+                elif resultat == "Mauvaise":
+                    defaites_154 = count
+        taux_123 = round((victoire_123 / (victoire_123 + defaites_123)) * 100, 1) if (victoire_123 + defaites_123) > 0 else 0
+        taux_154 = round((victoire_154 / (victoire_154 + defaites_154)) * 100, 1) if (victoire_154 + defaites_154) > 0 else 0
+        msg = (
+            f"🌐 Statistiques globales :\n"
+            f"- Victoires cote 1.23 : {victoire_123} | Défaites : {defaites_123} | Taux : {taux_123}%\n"
+            f"- Victoires cote 1.54 : {victoire_154} | Défaites : {defaites_154} | Taux : {taux_154}%\n"
+        )
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def test_rng(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    # Récupère le seed fourni ou en génère un aléatoire
+    if context.args:
+        seed = ' '.join(context.args)
+    else:
+        seed = str(datetime.datetime.now().timestamp())
+    rng = random.Random(seed)
+    sides_ref = ["gauche", "droite"]
+    pred_msgs = []
+    tirages = []
+    for cote in COTES:
+        case = rng.choice([1, 2, 3, 4, 5])
+        side_ref = rng.choice(sides_ref)
+        tirages.append((cote, case, side_ref))
+        pred_msgs.append(f"Cote {cote} : case {case} (depuis la {side_ref})")
+    msg = (
+        f"🧪 Test RNG\n"
+        f"Seed utilisé : {seed}\n"
+        f"Séquence générée :\n" + '\n'.join(pred_msgs)
+    )
+    await update.message.reply_text(msg)
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    if not context.args:
+        await update.message.reply_text("Utilisation : /broadcast <message>")
+        return
+    message = ' '.join(context.args)
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users")
+        user_ids = [row[0] for row in cursor.fetchall()]
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de la récupération des utilisateurs : {e}")
+        return
+    finally:
+        if conn:
+            conn.close()
+    success = 0
+    fail = 0
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=message)
+            success += 1
+        except Exception as e:
+            fail += 1
+    await update.message.reply_text(f"Message envoyé à {success} utilisateur(s). Échecs : {fail}.")
+
+async def notify_user_action(user_id, action_type, details, context):
+    """Notifie un utilisateur d'une action administrative le concernant."""
+    try:
+        messages = {
+            "role_change": f"👤 Votre rôle a été modifié : {details}",
+            "access_extended": f"⏰ Votre accès a été prolongé : {details}",
+            "access_reduced": f"⏰ Votre accès a été réduit : {details}",
+            "access_set": f"⏰ Votre date d'expiration a été définie : {details}",
+            "access_reset": f"⏰ Votre accès a été réinitialisé : {details}",
+            "suspended": "🚫 Votre accès a été suspendu par l'administrateur.",
+            "unsuspended": "✅ Votre accès a été réactivé par l'administrateur.",
+            "limits_changed": f"📊 Vos limites ont été modifiées : {details}",
+            "account_deleted": "❌ Votre compte a été supprimé par l'administrateur."
+        }
+        
+        message = messages.get(action_type, f"ℹ️ Action administrative : {details}")
+        await context.bot.send_message(chat_id=int(user_id), text=message)
+    except Exception as e:
+        logger.error(f"Erreur lors de la notification à l'utilisateur {user_id}: {e}")
 
 async def my_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -2807,6 +3253,244 @@ async def my_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         if conn:
             conn.close()
+
+async def auto_suspend(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute("SELECT user_id, predictions_today, limit_per_day, predictions_hour, limit_per_hour, predictions_total, limit_total, suspended FROM user_access")
+        rows = cursor.fetchall()
+        suspended_count = 0
+        for row in rows:
+            user_id, pred_today, lim_day, pred_hour, lim_hour, pred_total, lim_total, suspended = row
+            lim_day = lim_day if lim_day is not None else MAX_PREDICTIONS_PER_DAY
+            lim_hour = lim_hour if lim_hour is not None else MAX_PREDICTIONS_PER_HOUR
+            lim_total = lim_total if lim_total is not None else MAX_PREDICTIONS_TOTAL
+            if (pred_today is not None and pred_today >= lim_day) or (pred_hour is not None and pred_hour >= lim_hour) or (pred_total is not None and pred_total >= lim_total):
+                if suspended is None or suspended == 0:
+                    cursor.execute("UPDATE user_access SET suspended = 1 WHERE user_id = ?", (user_id,))
+                    try:
+                        await context.bot.send_message(chat_id=int(user_id), text="🚫 Tu as dépassé tes quotas. Ton accès a été suspendu automatiquement. Contacte l'administrateur si besoin.")
+                    except Exception as e:
+                        logger.warning(f"Impossible de notifier l'utilisateur {user_id} de la suspension auto : {e}")
+                    suspended_count += 1
+        conn.commit()
+        await update.message.reply_text(f"{suspended_count} utilisateur(s) suspendu(s) automatiquement pour dépassement de quotas.")
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de l'auto-suspension : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def auto_notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    if len(context.args) < 1:
+        await update.message.reply_text("Utilisation : /auto_notify <règle>\nExemples de règles : quota, expiration")
+        return
+    rule = context.args[0].lower()
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        notified = 0
+        if rule == "quota":
+            cursor.execute("SELECT user_id, predictions_today, limit_per_day FROM user_access")
+            for user_id, pred_today, lim_day in cursor.fetchall():
+                lim_day = lim_day if lim_day is not None else MAX_PREDICTIONS_PER_DAY
+                if pred_today is not None and lim_day > 0 and pred_today >= lim_day - 1:
+                    try:
+                        await context.bot.send_message(chat_id=int(user_id), text=f"⚠️ Attention : tu as presque atteint ta limite quotidienne de prédictions ({pred_today}/{lim_day}).")
+                        notified += 1
+                    except Exception as e:
+                        logger.warning(f"Impossible de notifier l'utilisateur {user_id} (quota) : {e}")
+        elif rule == "expiration":
+            cursor.execute("SELECT user_id, expiration FROM user_access")
+            for user_id, expiration in cursor.fetchall():
+                if expiration:
+                    exp_dt = datetime.datetime.strptime(expiration, "%Y-%m-%d %H:%M:%S")
+                    now_dt = datetime.datetime.now()
+                    delta = exp_dt - now_dt
+                    if 0 < delta.total_seconds() < 2*24*3600:
+                        try:
+                            await context.bot.send_message(chat_id=int(user_id), text=f"⏰ Ton accès expire bientôt ({expiration}). Pense à demander un renouvellement.")
+                            notified += 1
+                        except Exception as e:
+                            logger.warning(f"Impossible de notifier l'utilisateur {user_id} (expiration) : {e}")
+        else:
+            await update.message.reply_text("Règle inconnue. Utilise 'quota' ou 'expiration'.")
+            return
+        await update.message.reply_text(f"{notified} utilisateur(s) notifié(s) pour la règle '{rule}'.")
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de l'auto-notification : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def top_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    limit = 10
+    if context.args and context.args[0].isdigit():
+        limit = int(context.args[0])
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT h.user_id, u.name, u.username, COUNT(*)/2 as seqs
+            FROM history h
+            LEFT JOIN users u ON h.user_id = u.user_id
+            GROUP BY h.user_id
+            ORDER BY seqs DESC
+            LIMIT ?
+        """, (limit,))
+        rows = cursor.fetchall()
+        if not rows:
+            await update.message.reply_text("Aucun utilisateur trouvé.")
+            return
+        msg = f"🏆 Top {limit} utilisateurs (par séquences jouées) :\n"
+        for i, (user_id, name, username, seqs) in enumerate(rows, 1):
+            name = name or "-"
+            username = f"@{username}" if username else "-"
+            msg += f"{i}. {user_id} | {name} ({username}) : {int(seqs)} séquences\n"
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def usage_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM history")
+        total_entries = cursor.fetchone()[0]
+        total_sequences = total_entries // 2
+        cursor.execute("SELECT COUNT(DISTINCT user_id) FROM history")
+        total_users = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM users")
+        registered_users = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM user_access WHERE expiration > ?", (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),))
+        active_access = cursor.fetchone()[0]
+        msg = (
+            f"📈 Rapport d'utilisation global :\n"
+            f"- Séquences totales jouées : {total_sequences}\n"
+            f"- Utilisateurs ayant joué : {total_users}\n"
+            f"- Utilisateurs enregistrés : {registered_users}\n"
+            f"- Accès actifs : {active_access}\n"
+        )
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def global_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        # Taux de victoire global par cote
+        cursor.execute("SELECT cote, resultat, COUNT(*) FROM history WHERE resultat IN ('Bonne','Mauvaise') GROUP BY cote, resultat")
+        results = cursor.fetchall()
+        victoire_123 = victoire_154 = defaites_123 = defaites_154 = 0
+        for cote, resultat, count in results:
+            if cote == "1.23":
+                if resultat == "Bonne":
+                    victoire_123 = count
+                elif resultat == "Mauvaise":
+                    defaites_123 = count
+            elif cote == "1.54":
+                if resultat == "Bonne":
+                    victoire_154 = count
+                elif resultat == "Mauvaise":
+                    defaites_154 = count
+        taux_123 = round((victoire_123 / (victoire_123 + defaites_123)) * 100, 1) if (victoire_123 + defaites_123) > 0 else 0
+        taux_154 = round((victoire_154 / (victoire_154 + defaites_154)) * 100, 1) if (victoire_154 + defaites_154) > 0 else 0
+        msg = (
+            f"🌐 Statistiques globales :\n"
+            f"- Victoires cote 1.23 : {victoire_123} | Défaites : {defaites_123} | Taux : {taux_123}%\n"
+            f"- Victoires cote 1.54 : {victoire_154} | Défaites : {defaites_154} | Taux : {taux_154}%\n"
+        )
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur : {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def test_rng(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    # Récupère le seed fourni ou en génère un aléatoire
+    if context.args:
+        seed = ' '.join(context.args)
+    else:
+        seed = str(datetime.datetime.now().timestamp())
+    rng = random.Random(seed)
+    sides_ref = ["gauche", "droite"]
+    pred_msgs = []
+    tirages = []
+    for cote in COTES:
+        case = rng.choice([1, 2, 3, 4, 5])
+        side_ref = rng.choice(sides_ref)
+        tirages.append((cote, case, side_ref))
+        pred_msgs.append(f"Cote {cote} : case {case} (depuis la {side_ref})")
+    msg = (
+        f"🧪 Test RNG\n"
+        f"Seed utilisé : {seed}\n"
+        f"Séquence générée :\n" + '\n'.join(pred_msgs)
+    )
+    await update.message.reply_text(msg)
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔️ Seul l'administrateur peut utiliser cette commande.")
+        return
+    if not context.args:
+        await update.message.reply_text("Utilisation : /broadcast <message>")
+        return
+    message = ' '.join(context.args)
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users")
+        user_ids = [row[0] for row in cursor.fetchall()]
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de la récupération des utilisateurs : {e}")
+        return
+    finally:
+        if conn:
+            conn.close()
+    success = 0
+    fail = 0
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=message)
+            success += 1
+        except Exception as e:
+            fail += 1
+    await update.message.reply_text(f"Message envoyé à {success} utilisateur(s). Échecs : {fail}.")
 
 if __name__ == "__main__":
     main()
